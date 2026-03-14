@@ -1,0 +1,19 @@
+[Unit]
+Description=VOICEVOX Engine
+After=network.target
+
+[Service]
+Type=simple
+User=voicebot
+Group=voicebot
+# VOICEVOX Engine の展開先に合わせて変更してください
+ExecStart=/opt/voicevox_engine/run --host 127.0.0.1 --port 50021
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voicevox-engine
+
+[Install]
+WantedBy=multi-user.target

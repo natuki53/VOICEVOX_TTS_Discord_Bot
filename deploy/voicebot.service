@@ -1,0 +1,23 @@
+[Unit]
+Description=Discord VoiceBot (ずんだもん読み上げBot)
+After=network-online.target voicevox-engine.service
+Wants=network-online.target
+Requires=voicevox-engine.service
+
+[Service]
+Type=simple
+User=voicebot
+Group=voicebot
+WorkingDirectory=/opt/voicebot
+ExecStart=/opt/voicebot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/voicebot/.env
+
+# 標準出力・エラーをjournaldに転送
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voicebot
+
+[Install]
+WantedBy=multi-user.target

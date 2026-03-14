@@ -1,0 +1,25 @@
+# 環境変数（トークン等を含むため絶対にコミットしない）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# ログ
+*.log
+
+# VOICEVOX Engine ローカルバイナリ（必要なら別途配布）
+macos-arm64/
