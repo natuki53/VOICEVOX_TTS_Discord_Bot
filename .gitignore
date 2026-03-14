@@ -23,3 +23,4 @@ build/
 
 # VOICEVOX Engine ローカルバイナリ（必要なら別途配布）
 macos-arm64/
+voicevox_engine-windows-directml-*/
