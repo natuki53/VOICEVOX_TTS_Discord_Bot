@@ -1,37 +1,76 @@
-"""ボイスチャンネル管理Cog - /join, /leave, /speaker, /speed, /maxlength, /status + 入退室アナウンス"""
+"""ボイスチャンネル管理Cog - /join, /leave, /speaker, /speakerall, /style, /styleall, /speed, /maxlength, /status + 入退室アナウンス"""
 
 import asyncio
 import logging
+import time
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 import config
+from services.state_store import save_runtime_state
 from services.voicevox import VoicevoxError
 
 logger = logging.getLogger(__name__)
 
-SPEAKER_CHOICES = [
+IDLE_DISCONNECT_SECONDS = 60
+MAX_AUTOCOMPLETE_CHOICES = 25
+SPEAKER_CACHE_TTL_SECONDS = 60
+STYLE_CHOICES = [
     app_commands.Choice(name="ノーマル", value="normal"),
     app_commands.Choice(name="あまあま", value="amaama"),
     app_commands.Choice(name="ツンツン", value="tsuntsun"),
     app_commands.Choice(name="セクシー", value="sexy"),
 ]
-
 STYLE_NAMES = {
     "normal": "ノーマル",
     "amaama": "あまあま",
     "tsuntsun": "ツンツン",
     "sexy": "セクシー",
 }
-IDLE_DISCONNECT_SECONDS = 60
+NOTICE_COLORS = {
+    "info": discord.Color.blurple(),
+    "success": discord.Color.green(),
+    "warning": discord.Color.orange(),
+    "error": discord.Color.red(),
+}
+NOTICE_PREFIX = {
+    "info": "",
+    "success": "",
+    "warning": "⚠ ",
+    "error": "❌ ",
+}
 
 
 class VoiceCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
+        self._speaker_label_cache: dict[int, str] = {}
+        self._speaker_options_cache: list[tuple[int, str]] = []
+        self._speaker_cache_updated_at = 0.0
+        self._speaker_cache_lock = asyncio.Lock()
+
+    @staticmethod
+    def _pick_representative_style_id(styles: list[dict]) -> int | None:
+        """話者選択用に代表スタイルIDを1つ選ぶ。"""
+        talk_styles = [
+            style
+            for style in styles
+            if style.get("type") == "talk" and isinstance(style.get("id"), int)
+        ]
+        for style in talk_styles:
+            if str(style.get("name", "")).strip() == "ノーマル":
+                return style["id"]
+        if talk_styles:
+            return talk_styles[0]["id"]
+
+        for style in styles:
+            style_id = style.get("id")
+            if isinstance(style_id, int):
+                return style_id
+        return None
 
     def cog_unload(self) -> None:
         for task in self._idle_disconnect_tasks.values():
@@ -130,9 +169,10 @@ class VoiceCog(commands.Cog):
     ) -> discord.Guild | None:
         guild = interaction.guild
         if guild is None:
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "このコマンドはサーバー内でのみ利用できます。",
+                title="このコマンドはサーバー内でのみ利用できます",
+                kind="error",
                 ephemeral=True,
             )
             return None
@@ -141,8 +181,112 @@ class VoiceCog(commands.Cog):
     def _get_speaker_id(self, guild_id: int) -> int:
         return config.GUILD_SPEAKER_MAP.get(guild_id, config.DEFAULT_SPEAKER_ID)
 
+    def _get_user_speaker_id(self, guild_id: int, user_id: int) -> int:
+        user_speakers = config.GUILD_USER_SPEAKER_MAP.get(guild_id, {})
+        return user_speakers.get(user_id, self._get_speaker_id(guild_id))
+
+    def _set_user_speaker_id(self, guild_id: int, user_id: int, speaker_id: int) -> None:
+        user_speakers = config.GUILD_USER_SPEAKER_MAP.setdefault(guild_id, {})
+        user_speakers[user_id] = speaker_id
+        self._persist_runtime_state()
+
+    def _persist_runtime_state(self) -> None:
+        save_runtime_state()
+
     def _get_speed(self, guild_id: int) -> float:
         return config.GUILD_SPEED_MAP.get(guild_id, config.DEFAULT_SPEED)
+
+    async def _refresh_speaker_cache(self, *, force: bool = False) -> None:
+        if self.bot.voicevox is None:
+            return
+
+        now = time.monotonic()
+        if (
+            not force
+            and self._speaker_options_cache
+            and (now - self._speaker_cache_updated_at) < SPEAKER_CACHE_TTL_SECONDS
+        ):
+            return
+
+        async with self._speaker_cache_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._speaker_options_cache
+                and (now - self._speaker_cache_updated_at) < SPEAKER_CACHE_TTL_SECONDS
+            ):
+                return
+
+            try:
+                speakers = await self.bot.voicevox.list_speakers()
+            except VoicevoxError as e:
+                logger.warning("話者一覧の取得に失敗しました: %s", e)
+                return
+            except Exception as e:
+                logger.error("話者一覧の取得中に予期しないエラーが発生しました: %s", e)
+                return
+
+            labels: dict[int, str] = {}
+            options: list[tuple[int, str]] = []
+            for speaker in speakers:
+                if not isinstance(speaker, dict):
+                    continue
+
+                speaker_name = str(speaker.get("name", "不明話者"))
+                styles = speaker.get("styles")
+                if not isinstance(styles, list):
+                    continue
+
+                representative_style_id = self._pick_representative_style_id(styles)
+                if representative_style_id is not None:
+                    options.append((representative_style_id, speaker_name))
+
+                for style in styles:
+                    if not isinstance(style, dict):
+                        continue
+
+                    style_id = style.get("id")
+                    if not isinstance(style_id, int):
+                        continue
+
+                    labels[style_id] = speaker_name
+
+            self._speaker_label_cache = labels
+            self._speaker_options_cache = options
+            self._speaker_cache_updated_at = time.monotonic()
+
+    def _get_speaker_display_name(self, speaker_id: int) -> str:
+        label = self._speaker_label_cache.get(speaker_id)
+        if label:
+            return label
+        return "不明な話者"
+
+    def _get_speaker_read_name(self, speaker_id: int) -> str:
+        label = self._speaker_label_cache.get(speaker_id)
+        if label:
+            return label
+        return "不明な話者"
+
+    async def speaker_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        del interaction
+        await self._refresh_speaker_cache()
+
+        query = current.casefold().strip()
+        choices: list[app_commands.Choice[str]] = []
+        for speaker_id, label in self._speaker_options_cache:
+            display = label
+            if query and query not in display.casefold():
+                continue
+            choices.append(
+                app_commands.Choice(name=display[:100], value=str(speaker_id))
+            )
+            if len(choices) >= MAX_AUTOCOMPLETE_CHOICES:
+                break
+        return choices
 
     def _has_human_member(
         self,
@@ -154,8 +298,10 @@ class VoiceCog(commands.Cog):
         self.bot.audio_queue.cleanup(guild_id)
         config.TTS_CHANNEL_MAP.pop(guild_id, None)
         config.GUILD_SPEAKER_MAP.pop(guild_id, None)
+        config.GUILD_USER_SPEAKER_MAP.pop(guild_id, None)
         config.GUILD_SPEED_MAP.pop(guild_id, None)
         config.GUILD_MAX_LENGTH_MAP.pop(guild_id, None)
+        self._persist_runtime_state()
 
     def _cancel_idle_disconnect(self, guild_id: int) -> None:
         task = self._idle_disconnect_tasks.pop(guild_id, None)
@@ -175,13 +321,43 @@ class VoiceCog(commands.Cog):
         voice_channel_name: str,
         read_channel_mention: str,
     ) -> discord.Embed:
-        embed = discord.Embed(
-            title="ずんだもん読み上げBot - 切断しました",
-            color=discord.Color.red(),
-        )
+        embed = self._build_notice_embed(title="切断しました", kind="error")
         embed.add_field(name="ボイスチャンネル", value=voice_channel_name, inline=False)
         embed.add_field(name="読み上げチャンネル", value=read_channel_mention, inline=False)
         return embed
+
+    def _build_notice_embed(
+        self,
+        title: str,
+        description: str | None = None,
+        *,
+        kind: str = "info",
+    ) -> discord.Embed:
+        color = NOTICE_COLORS.get(kind, NOTICE_COLORS["info"])
+        prefix = NOTICE_PREFIX.get(kind, "")
+        embed = discord.Embed(title=f"{prefix}{title}", color=color)
+        if description:
+            embed.description = description
+        return embed
+
+    async def _send_notice(
+        self,
+        interaction: discord.Interaction,
+        *,
+        title: str,
+        description: str | None = None,
+        kind: str = "info",
+        ephemeral: bool = False,
+    ) -> None:
+        await self._send_once(
+            interaction,
+            embed=self._build_notice_embed(
+                title=title,
+                description=description,
+                kind=kind,
+            ),
+            ephemeral=ephemeral,
+        )
 
     async def _defer_once(self, interaction: discord.Interaction) -> bool:
         """Interactionを一度だけdeferする。重複応答時はFalseを返す。"""
@@ -300,13 +476,15 @@ class VoiceCog(commands.Cog):
         text: str,
         guild: discord.Guild,
         voice_client: discord.VoiceClient,
+        speaker_id: int | None = None,
     ) -> None:
         """テキストをTTSで読み上げキューに追加する"""
         if self.bot.voicevox is None:
             return
 
         try:
-            speaker_id = self._get_speaker_id(guild.id)
+            if speaker_id is None:
+                speaker_id = self._get_speaker_id(guild.id)
             speed = self._get_speed(guild.id)
             wav = await self.bot.voicevox.tts(text, speaker_id, speed)
             await self.bot.audio_queue.enqueue(guild.id, wav, voice_client)
@@ -330,11 +508,17 @@ class VoiceCog(commands.Cog):
             return
 
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.followup.send("ボイスチャンネルに参加してから呼び出してください。")
+            await self._send_notice(
+                interaction,
+                title="ボイスチャンネルに参加してください",
+                description="/join を実行する前に、参加するチャンネルを選択してください。",
+                kind="warning",
+            )
             return
 
         target_vc = interaction.user.voice.channel
         vc = await self._get_or_recover_vc(guild)
+        current_read_channel_id = config.TTS_CHANNEL_MAP.get(guild.id)
 
         channel_mention = (
             interaction.channel.mention if interaction.channel else f"<#{interaction.channel_id}>"
@@ -342,48 +526,67 @@ class VoiceCog(commands.Cog):
 
         if vc and vc.channel == target_vc:
             self._cancel_idle_disconnect(guild.id)
+            if current_read_channel_id == interaction.channel_id:
+                await self._send_notice(
+                    interaction,
+                    title=f"すでに {target_vc.name} に接続しています",
+                    kind="info",
+                )
+                return
             config.TTS_CHANNEL_MAP[guild.id] = interaction.channel_id
-            await interaction.followup.send(
-                f"すでに {target_vc.name} にいます。読み上げチャンネルを {channel_mention} に変更しました。"
+            self._persist_runtime_state()
+            await self._send_notice(
+                interaction,
+                title="読み上げチャンネルを変更しました",
+                description=f"接続中のボイスチャンネル: **{target_vc.name}**\n読み上げチャンネル: {channel_mention}",
+                kind="success",
             )
             return
 
+        moved = vc is not None and vc.channel != target_vc
         try:
             if vc:
                 await vc.move_to(target_vc)
             else:
                 vc = await target_vc.connect(timeout=15.0, reconnect=True)
         except asyncio.TimeoutError:
-            await interaction.followup.send(
-                "ボイスチャンネルへの接続がタイムアウトしました。時間をおいて再試行してください。"
+            await self._send_notice(
+                interaction,
+                title="ボイスチャンネルへの接続がタイムアウトしました",
+                description="時間をおいて再試行してください。",
+                kind="error",
             )
             return
         except Exception as e:
             logger.error("VC接続エラー: %s", e)
-            await interaction.followup.send(
-                "ボイスチャンネルへの接続に失敗しました。"
+            await self._send_notice(
+                interaction,
+                title="ボイスチャンネルへの接続に失敗しました",
+                description="接続先チャンネルやBot権限を確認してください。",
+                kind="error",
             )
             return
 
         self._cancel_idle_disconnect(guild.id)
         config.TTS_CHANNEL_MAP[guild.id] = interaction.channel_id
+        self._persist_runtime_state()
 
-        speaker_id = self._get_speaker_id(guild.id)
-        style_map = {v: k for k, v in config.SPEAKERS.items()}
-        style_key = style_map.get(speaker_id, "normal")
-        style_display = STYLE_NAMES.get(style_key, style_key)
+        await self._refresh_speaker_cache()
+        speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
+        speaker_display = self._get_speaker_display_name(speaker_id)
         speed = self._get_speed(guild.id)
         max_length = config.GUILD_MAX_LENGTH_MAP.get(guild.id, config.MAX_TEXT_LENGTH)
 
-        embed = discord.Embed(title="ずんだもん読み上げBot - 接続しました", color=discord.Color.green())
+        title = "ボイスチャンネルを移動しました" if moved else "ボイスチャンネルに接続しました"
+        embed = self._build_notice_embed(title=title, kind="success")
         embed.add_field(name="ボイスチャンネル", value=target_vc.name, inline=False)
         embed.add_field(name="読み上げチャンネル", value=channel_mention, inline=False)
-        embed.add_field(name="声スタイル", value=style_display, inline=True)
+        embed.add_field(name="話者", value=speaker_display, inline=True)
         embed.add_field(name="読み上げ速度", value=str(speed), inline=True)
         embed.add_field(name="最大文字数", value=f"{max_length}文字", inline=True)
 
-        await interaction.followup.send(embed=embed)
-        await self._speak("接続しました。", guild, vc)
+        await self._send_once(interaction, embed=embed)
+        await self._speak("移動しました。" if moved else "接続しました。", guild, vc)
 
     @app_commands.command(name="leave", description="ボイスチャンネルから退出して読み上げを停止します")
     @app_commands.guild_only()
@@ -399,7 +602,12 @@ class VoiceCog(commands.Cog):
         if not vc:
             self._cancel_idle_disconnect(guild.id)
             self._clear_guild_runtime(guild.id)
-            await interaction.followup.send("すでに切断済みです。", ephemeral=True)
+            await self._send_notice(
+                interaction,
+                title="すでに切断済みです",
+                kind="info",
+                ephemeral=True,
+            )
             return
 
         voice_channel_name = vc.channel.name
@@ -424,40 +632,255 @@ class VoiceCog(commands.Cog):
         except Exception as e:
             logger.warning("VC切断時にエラーが発生しました (guild=%d): %s", guild.id, e)
 
-        await interaction.followup.send(
+        await self._send_once(
+            interaction,
             embed=self._build_disconnect_embed(
                 voice_channel_name,
                 read_channel_mention,
-            )
+            ),
         )
 
-    @app_commands.command(name="speaker", description="ずんだもんの声スタイルを変更します")
+    @app_commands.command(name="speaker", description="あなたの話者を変更します")
     @app_commands.guild_only()
-    @app_commands.describe(style="声スタイルを選んでください")
-    @app_commands.choices(style=SPEAKER_CHOICES)
-    async def speaker(self, interaction: discord.Interaction, style: str) -> None:
+    @app_commands.describe(speaker="あなたの話者を選んでください（候補から選択）")
+    @app_commands.autocomplete(speaker=speaker_autocomplete)
+    async def speaker(self, interaction: discord.Interaction, speaker: str) -> None:
         guild = await self._ensure_guild(interaction)
         if guild is None:
             return
 
         vc = await self._get_or_recover_vc(guild)
         if not vc:
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "読み上げ中ではありません。先に /join を実行してください。",
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
                 ephemeral=True,
             )
             return
 
-        speaker_id = config.SPEAKERS.get(style, config.DEFAULT_SPEAKER_ID)
-        config.GUILD_SPEAKER_MAP[guild.id] = speaker_id
-        style_display = STYLE_NAMES.get(style, style)
+        try:
+            speaker_id = int(speaker)
+        except ValueError:
+            await self._send_notice(
+                interaction,
+                title="話者の指定が不正です",
+                description="候補から選択してください。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
 
-        await self._send_once(
+        await self._refresh_speaker_cache(force=True)
+        if self._speaker_options_cache and speaker_id not in self._speaker_label_cache:
+            await self._send_notice(
+                interaction,
+                title="指定した話者は利用できません",
+                description="現在のVOICEVOX Engineに存在しない可能性があります。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        self._set_user_speaker_id(guild.id, interaction.user.id, speaker_id)
+        speaker_display = self._get_speaker_display_name(speaker_id)
+        speaker_read_name = self._get_speaker_read_name(speaker_id)
+        user_name = interaction.user.display_name
+
+        await self._send_notice(
             interaction,
-            f"声スタイルを **{style_display}** に変更しました。"
+            title=f"{user_name}の話者を変更しました",
+            description=f"現在の{user_name}の話者: **{speaker_display}**",
+            kind="success",
         )
-        await self._speak(f"声スタイルを{style_display}に変更しました。", guild, vc)
+        await self._speak(
+            f"{user_name}の話者を{speaker_read_name}に変更しました。",
+            guild,
+            vc,
+            speaker_id=speaker_id,
+        )
+
+    @app_commands.command(name="speakerall", description="サーバー全体のデフォルト話者を変更します")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(speaker="全体デフォルト話者を選んでください（候補から選択）")
+    @app_commands.autocomplete(speaker=speaker_autocomplete)
+    async def speakerall(self, interaction: discord.Interaction, speaker: str) -> None:
+        guild = await self._ensure_guild(interaction)
+        if guild is None:
+            return
+
+        vc = await self._get_or_recover_vc(guild)
+        if not vc:
+            await self._send_notice(
+                interaction,
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            speaker_id = int(speaker)
+        except ValueError:
+            await self._send_notice(
+                interaction,
+                title="話者の指定が不正です",
+                description="候補から選択してください。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        await self._refresh_speaker_cache(force=True)
+        if self._speaker_options_cache and speaker_id not in self._speaker_label_cache:
+            await self._send_notice(
+                interaction,
+                title="指定した話者は利用できません",
+                description="現在のVOICEVOX Engineに存在しない可能性があります。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        config.GUILD_SPEAKER_MAP[guild.id] = speaker_id
+        self._persist_runtime_state()
+        speaker_display = self._get_speaker_display_name(speaker_id)
+        speaker_read_name = self._get_speaker_read_name(speaker_id)
+
+        await self._send_notice(
+            interaction,
+            title="全体デフォルト話者を変更しました",
+            description=f"現在の全体デフォルト話者: **{speaker_display}**",
+            kind="success",
+        )
+        await self._speak(
+            f"全体デフォルト話者を{speaker_read_name}に変更しました。",
+            guild,
+            vc,
+            speaker_id=speaker_id,
+        )
+
+    @app_commands.command(name="style", description="あなたの声スタイル（互換プリセット）を変更します")
+    @app_commands.guild_only()
+    @app_commands.describe(style="互換プリセットを選んでください")
+    @app_commands.choices(style=STYLE_CHOICES)
+    async def style(self, interaction: discord.Interaction, style: str) -> None:
+        guild = await self._ensure_guild(interaction)
+        if guild is None:
+            return
+
+        vc = await self._get_or_recover_vc(guild)
+        if not vc:
+            await self._send_notice(
+                interaction,
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
+                ephemeral=True,
+            )
+            return
+
+        speaker_id = config.LEGACY_STYLE_TO_SPEAKER_ID.get(style)
+        if speaker_id is None:
+            await self._send_notice(
+                interaction,
+                title="不正な声スタイルです",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        await self._refresh_speaker_cache(force=True)
+        if self._speaker_options_cache and speaker_id not in self._speaker_label_cache:
+            await self._send_notice(
+                interaction,
+                title="指定した声スタイルは利用できません",
+                description="このVOICEVOX環境に存在しない可能性があります。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        self._set_user_speaker_id(guild.id, interaction.user.id, speaker_id)
+        style_display = STYLE_NAMES.get(style, style)
+        speaker_display = self._get_speaker_display_name(speaker_id)
+        user_name = interaction.user.display_name
+
+        await self._send_notice(
+            interaction,
+            title=f"{user_name}の声スタイルを変更しました",
+            description=f"現在の{user_name}のスタイル: **{style_display}**\n話者: {speaker_display}",
+            kind="success",
+        )
+        await self._speak(
+            f"{user_name}の声スタイルを{style_display}に変更しました。",
+            guild,
+            vc,
+            speaker_id=speaker_id,
+        )
+
+    @app_commands.command(name="styleall", description="サーバー全体のデフォルト声スタイル（互換プリセット）を変更します")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(style="全体デフォルトの互換プリセットを選んでください")
+    @app_commands.choices(style=STYLE_CHOICES)
+    async def styleall(self, interaction: discord.Interaction, style: str) -> None:
+        guild = await self._ensure_guild(interaction)
+        if guild is None:
+            return
+
+        vc = await self._get_or_recover_vc(guild)
+        if not vc:
+            await self._send_notice(
+                interaction,
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
+                ephemeral=True,
+            )
+            return
+
+        speaker_id = config.LEGACY_STYLE_TO_SPEAKER_ID.get(style)
+        if speaker_id is None:
+            await self._send_notice(
+                interaction,
+                title="不正な声スタイルです",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        await self._refresh_speaker_cache(force=True)
+        if self._speaker_options_cache and speaker_id not in self._speaker_label_cache:
+            await self._send_notice(
+                interaction,
+                title="指定した声スタイルは利用できません",
+                description="このVOICEVOX環境に存在しない可能性があります。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        config.GUILD_SPEAKER_MAP[guild.id] = speaker_id
+        self._persist_runtime_state()
+        style_display = STYLE_NAMES.get(style, style)
+        speaker_display = self._get_speaker_display_name(speaker_id)
+
+        await self._send_notice(
+            interaction,
+            title="全体デフォルト声スタイルを変更しました",
+            description=f"現在の全体デフォルトスタイル: **{style_display}**\n話者: {speaker_display}",
+            kind="success",
+        )
+        await self._speak(
+            f"全体デフォルト声スタイルを{style_display}に変更しました。",
+            guild,
+            vc,
+            speaker_id=speaker_id,
+        )
 
     @app_commands.command(name="speed", description="読み上げ速度を変更します（0.5〜2.0、デフォルト: 1.0）")
     @app_commands.guild_only()
@@ -469,26 +892,33 @@ class VoiceCog(commands.Cog):
 
         vc = await self._get_or_recover_vc(guild)
         if not vc:
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "読み上げ中ではありません。先に /join を実行してください。",
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
                 ephemeral=True,
             )
             return
 
         if not (0.5 <= value <= 2.0):
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "速度は 0.5〜2.0 の範囲で指定してください。",
+                title="速度の指定が範囲外です",
+                description="0.5〜2.0 の範囲で指定してください。",
+                kind="error",
                 ephemeral=True,
             )
             return
 
         config.GUILD_SPEED_MAP[guild.id] = value
+        self._persist_runtime_state()
         message = f"読み上げ速度を {value} に変更しました。"
-        await self._send_once(
+        await self._send_notice(
             interaction,
-            message
+            title="読み上げ速度を変更しました",
+            description=f"現在の速度: **{value}**",
+            kind="success",
         )
         await self._speak(message, guild, vc)
 
@@ -502,48 +932,58 @@ class VoiceCog(commands.Cog):
 
         vc = await self._get_or_recover_vc(guild)
         if not vc:
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "読み上げ中ではありません。先に /join を実行してください。",
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
                 ephemeral=True,
             )
             return
 
         if not (10 <= length <= 500):
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "文字数は 10〜500 の範囲で指定してください。",
+                title="文字数の指定が範囲外です",
+                description="10〜500 の範囲で指定してください。",
+                kind="error",
                 ephemeral=True,
             )
             return
 
         config.GUILD_MAX_LENGTH_MAP[guild.id] = length
-        await self._send_once(
+        self._persist_runtime_state()
+        await self._send_notice(
             interaction,
-            f"最大読み上げ文字数を **{length}文字** に変更しました。"
+            title="最大読み上げ文字数を変更しました",
+            description=f"現在の上限: **{length}文字**",
+            kind="success",
         )
 
     @app_commands.command(name="about", description="このBotについての情報を表示します")
     async def about(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
-            title="ずんだもん読み上げBot",
-            description="VOICEVOXのずんだもん音声でDiscordのテキストを読み上げるBotなのだ。",
+            title="VOICEVOX読み上げBot",
+            description="VOICEVOX音声でDiscordのテキストを読み上げるBotです。",
             color=discord.Color.green(),
         )
         embed.add_field(
             name="使い方",
-            value="`/join` → ボイスチャンネルに参加\n`/leave` → 退出\n`/speaker` → 声スタイル変更\n`/speed` → 速度変更\n`/maxlength` → 最大文字数変更\n`/status` → 現在の設定確認",
+            value="`/join` → ボイスチャンネルに参加\n`/leave` → 退出\n`/speaker` → あなたの話者変更\n`/speakerall` → 全体デフォルト話者変更\n`/style` → あなたの互換スタイル変更\n`/styleall` → 全体デフォルト互換スタイル変更\n`/speed` → 速度変更\n`/maxlength` → 最大文字数変更\n`/status` → 現在の設定確認",
             inline=False,
         )
         embed.add_field(
             name="クレジット",
             value=(
                 "**VOICEVOX** - 音声合成エンジン\n"
-                "[https://voicevox.hiroshiba.jp/](https://voicevox.hiroshiba.jp/)\n\n"
-                "**ずんだもん** - CV: 四国めたん・ずんだもん（VOICEVOX）\n"
-                "© Hiroshiba Kazuyuki\n\n"
+                "https://voicevox.hiroshiba.jp/\n\n"
+                "**VOICEVOX利用規約**\n"
+                "https://voicevox.hiroshiba.jp/term/\n\n"
+                "**話者クレジット（デフォルト互換プリセット）**\n"
+                "`VOICEVOX:ずんだもん`\n\n"
+                "各話者の利用条件はVOICEVOX公式規約・各音声ライセンスを確認してください。\n\n"
                 "**discord.py** - Discord API ライブラリ\n"
-                "[https://github.com/Rapptz/discord.py](https://github.com/Rapptz/discord.py)"
+                "https://github.com/Rapptz/discord.py"
             ),
             inline=False,
         )
@@ -559,9 +999,10 @@ class VoiceCog(commands.Cog):
 
         vc = await self._get_or_recover_vc(guild)
         if not vc:
-            await self._send_once(
+            await self._send_notice(
                 interaction,
-                "現在ボイスチャンネルに参加していません。",
+                title="現在ボイスチャンネルに参加していません",
+                kind="warning",
                 ephemeral=True,
             )
             return
@@ -569,18 +1010,20 @@ class VoiceCog(commands.Cog):
         channel_id = config.TTS_CHANNEL_MAP.get(guild.id)
         channel_mention = f"<#{channel_id}>" if channel_id else "未設定"
 
-        speaker_id = self._get_speaker_id(guild.id)
-        style_map = {v: k for k, v in config.SPEAKERS.items()}
-        style_key = style_map.get(speaker_id, "normal")
-        style_display = STYLE_NAMES.get(style_key, style_key)
+        await self._refresh_speaker_cache()
+        speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
+        default_speaker_id = self._get_speaker_id(guild.id)
+        speaker_display = self._get_speaker_display_name(speaker_id)
+        default_speaker_display = self._get_speaker_display_name(default_speaker_id)
 
         speed = self._get_speed(guild.id)
         max_length = config.GUILD_MAX_LENGTH_MAP.get(guild.id, config.MAX_TEXT_LENGTH)
 
-        embed = discord.Embed(title="ずんだもん読み上げBot - 状態", color=discord.Color.green())
+        embed = self._build_notice_embed(title="現在の状態", kind="info")
         embed.add_field(name="ボイスチャンネル", value=vc.channel.name, inline=False)
         embed.add_field(name="読み上げチャンネル", value=channel_mention, inline=False)
-        embed.add_field(name="声スタイル", value=style_display, inline=True)
+        embed.add_field(name="あなたの話者", value=speaker_display, inline=True)
+        embed.add_field(name="全体デフォルト話者", value=default_speaker_display, inline=True)
         embed.add_field(name="読み上げ速度", value=str(speed), inline=True)
         embed.add_field(name="最大文字数", value=f"{max_length}文字", inline=True)
 

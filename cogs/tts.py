@@ -1,5 +1,6 @@
 """TTS読み上げCog - on_messageハンドラとテキスト前処理"""
 
+from collections import Counter
 import logging
 import re
 
@@ -16,6 +17,10 @@ RE_URL = re.compile(r"https?://\S+")
 RE_CUSTOM_EMOJI = re.compile(r"<a?:\w+:\d+>")
 RE_MENTION = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 RE_WHITESPACE = re.compile(r"\s+")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml"}
 
 
 def preprocess_text(text: str, max_length: int = config.MAX_TEXT_LENGTH) -> str:
@@ -45,6 +50,46 @@ def preprocess_text(text: str, max_length: int = config.MAX_TEXT_LENGTH) -> str:
         text = text[:max_length] + "、以下省略"
 
     return text
+
+
+def classify_attachment(attachment: discord.Attachment) -> str:
+    """添付ファイルを読み上げ用の種類ラベルに分類する。"""
+    content_type = (attachment.content_type or "").lower()
+    filename = attachment.filename.lower()
+
+    if content_type.startswith("image/") or any(
+        filename.endswith(ext) for ext in IMAGE_EXTENSIONS
+    ):
+        return "画像ファイル"
+    if content_type.startswith("audio/") or any(
+        filename.endswith(ext) for ext in AUDIO_EXTENSIONS
+    ):
+        return "音声ファイル"
+    if content_type.startswith("video/") or any(
+        filename.endswith(ext) for ext in VIDEO_EXTENSIONS
+    ):
+        return "動画ファイル"
+    if content_type == "application/pdf" or filename.endswith(".pdf"):
+        return "PDFファイル"
+    if content_type.startswith("text/") or any(
+        filename.endswith(ext) for ext in TEXT_EXTENSIONS
+    ):
+        return "テキストファイル"
+    return "ファイル"
+
+
+def summarize_attachments(attachments: list[discord.Attachment]) -> str:
+    """添付ファイル一覧を短い読み上げ文に変換する。"""
+    if not attachments:
+        return ""
+
+    labels = [classify_attachment(attachment) for attachment in attachments]
+    counts = Counter(labels)
+    parts = [
+        f"{label}{count}件" if count > 1 else f"{label}1件"
+        for label, count in counts.items()
+    ]
+    return "、".join(parts) + "を添付"
 
 
 class TtsCog(commands.Cog):
@@ -94,24 +139,30 @@ class TtsCog(commands.Cog):
         if not vc:
             return
 
-        # メッセージ内容が空の場合は無視（添付ファイルのみ等）
-        if not message.content.strip():
+        # 本文・添付の両方が空なら無視
+        if not message.content.strip() and not message.attachments:
             return
 
         # --- テキスト前処理 ---
         max_length = config.GUILD_MAX_LENGTH_MAP.get(guild.id, config.MAX_TEXT_LENGTH)
         cleaned = preprocess_text(message.content, max_length)
+        attachment_summary = summarize_attachments(message.attachments)
 
-        # 前処理後に空になった場合は無視（URL・絵文字のみ等）
-        if not cleaned:
+        # 前処理後も読み上げ対象が無ければ無視（URL・絵文字のみ等）
+        read_parts = [part for part in (cleaned, attachment_summary) if part]
+        if not read_parts:
             return
 
         # ユーザー名を冒頭に付与
         display_name = message.author.display_name
-        read_text = f"{display_name}。{cleaned}"
+        read_text = f"{display_name}。{'。'.join(read_parts)}"
 
         # --- TTS合成 → キューに追加 ---
-        speaker_id = config.GUILD_SPEAKER_MAP.get(guild.id, config.DEFAULT_SPEAKER_ID)
+        user_speakers = config.GUILD_USER_SPEAKER_MAP.get(guild.id, {})
+        speaker_id = user_speakers.get(
+            message.author.id,
+            config.GUILD_SPEAKER_MAP.get(guild.id, config.DEFAULT_SPEAKER_ID),
+        )
         speed = config.GUILD_SPEED_MAP.get(guild.id, config.DEFAULT_SPEED)
         try:
             if self.bot.voicevox is None:

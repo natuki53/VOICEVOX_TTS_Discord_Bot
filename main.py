@@ -13,6 +13,7 @@ from discord.ext import commands
 import config
 from services.voicevox import VoicevoxClient
 from services.audio_queue import AudioQueueManager
+from services.state_store import load_runtime_state, save_runtime_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +65,8 @@ class VoiceBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Bot起動時の初期化処理"""
+        load_runtime_state()
+
         self._session = aiohttp.ClientSession()
         self.voicevox = VoicevoxClient(config.VOICEVOX_BASE_URL, self._session)
 
@@ -83,8 +86,20 @@ class VoiceBot(commands.Bot):
             logger.info("Cog読み込み完了: %s", cog)
 
         # スラッシュコマンドの同期
-        await self.tree.sync()
-        logger.info("スラッシュコマンドを同期しました")
+        if config.COMMAND_GUILD_ID is not None:
+            guild = discord.Object(id=config.COMMAND_GUILD_ID)
+            # 過去に残ったギルドコマンド定義を一度クリアして再同期する
+            self.tree.clear_commands(guild=guild)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info(
+                "スラッシュコマンドをギルド同期しました (guild_id=%d, count=%d)",
+                config.COMMAND_GUILD_ID,
+                len(synced),
+            )
+        else:
+            synced = await self.tree.sync()
+            logger.info("スラッシュコマンドをグローバル同期しました (count=%d)", len(synced))
 
     async def on_ready(self) -> None:
         logger.info("Bot起動完了: %s (ID: %s)", self.user, self.user.id)
@@ -111,6 +126,7 @@ class VoiceBot(commands.Bot):
 
     async def close(self) -> None:
         """Bot終了時のクリーンアップ"""
+        save_runtime_state()
         self.audio_queue.cleanup_all()
         if self._session:
             await self._session.close()

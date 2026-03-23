@@ -1,5 +1,7 @@
 """VOICEVOX Engine HTTPクライアント（非同期・aiohttp使用）"""
 
+from typing import Any
+
 import aiohttp
 
 TIMEOUT = aiohttp.ClientTimeout(total=10)
@@ -46,6 +48,20 @@ class VoicevoxClient:
         query = await self.audio_query(text, speaker_id)
         query["speedScale"] = speed
         return await self.synthesize(query, speaker_id)
+
+    async def list_speakers(self) -> list[dict[str, Any]]:
+        """利用可能な話者・スタイル一覧を取得する"""
+        url = f"{self._base_url}/speakers"
+        async with self._session.get(url, timeout=TIMEOUT) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise VoicevoxError(
+                    f"speakers failed: HTTP {resp.status} - {body}"
+                )
+            data = await resp.json()
+            if not isinstance(data, list):
+                raise VoicevoxError("speakers failed: unexpected response format")
+            return data
 
     async def check_health(self) -> bool:
         """VOICEVOX Engineが起動しているか確認する"""
