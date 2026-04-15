@@ -60,7 +60,7 @@ class VoiceBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
         self.voicevox: VoicevoxClient | None = None
-        self.audio_queue: AudioQueueManager = AudioQueueManager()
+        self.audio_queue: AudioQueueManager | None = None
         self._session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
@@ -69,6 +69,7 @@ class VoiceBot(commands.Bot):
 
         self._session = aiohttp.ClientSession()
         self.voicevox = VoicevoxClient(config.VOICEVOX_BASE_URL, self._session)
+        self.audio_queue = AudioQueueManager(synthesizer=self.voicevox.tts)
 
         # VOICEVOX Engine の疎通確認
         if await self.voicevox.check_health():
@@ -127,7 +128,8 @@ class VoiceBot(commands.Bot):
     async def close(self) -> None:
         """Bot終了時のクリーンアップ"""
         save_runtime_state()
-        self.audio_queue.cleanup_all()
+        if self.audio_queue:
+            self.audio_queue.cleanup_all()
         if self._session:
             await self._session.close()
         await super().close()

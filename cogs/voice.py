@@ -486,10 +486,7 @@ class VoiceCog(commands.Cog):
             if speaker_id is None:
                 speaker_id = self._get_speaker_id(guild.id)
             speed = self._get_speed(guild.id)
-            wav = await self.bot.voicevox.tts(text, speaker_id, speed)
-            await self.bot.audio_queue.enqueue(guild.id, wav, voice_client)
-        except VoicevoxError as e:
-            logger.warning("TTS合成エラー: %s", e)
+            await self.bot.audio_queue.enqueue(guild.id, text, speaker_id, speed, voice_client)
         except Exception as e:
             logger.error("予期しないエラー (_speak): %s", e)
 
@@ -618,7 +615,7 @@ class VoiceCog(commands.Cog):
         await self._speak("切断します。またね。", guild, vc)
 
         try:
-            q = self.bot.audio_queue._queues.get(guild.id)
+            q = self.bot.audio_queue._play_queues.get(guild.id)
             if q:
                 await asyncio.wait_for(q.join(), timeout=3.0)
         except asyncio.TimeoutError:

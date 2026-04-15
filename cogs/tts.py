@@ -8,7 +8,6 @@ import discord
 from discord.ext import commands
 
 import config
-from services.voicevox import VoicevoxError
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +156,7 @@ class TtsCog(commands.Cog):
         display_name = message.author.display_name
         read_text = f"{display_name}。{'。'.join(read_parts)}"
 
-        # --- TTS合成 → キューに追加 ---
+        # --- TTS合成ジョブをキューに追加（合成は再生ワーカーと並走） ---
         user_speakers = config.GUILD_USER_SPEAKER_MAP.get(guild.id, {})
         speaker_id = user_speakers.get(
             message.author.id,
@@ -165,12 +164,7 @@ class TtsCog(commands.Cog):
         )
         speed = config.GUILD_SPEED_MAP.get(guild.id, config.DEFAULT_SPEED)
         try:
-            if self.bot.voicevox is None:
-                return
-            wav = await self.bot.voicevox.tts(read_text, speaker_id, speed)
-            await self.bot.audio_queue.enqueue(guild.id, wav, vc)
-        except VoicevoxError as e:
-            logger.warning("TTS合成エラー (guild=%d, user=%s): %s", guild.id, message.author, e)
+            await self.bot.audio_queue.enqueue(guild.id, read_text, speaker_id, speed, vc)
         except Exception as e:
             logger.error("予期しないエラー (on_message): %s", e)
 

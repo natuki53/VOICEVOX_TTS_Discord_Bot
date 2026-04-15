@@ -1,58 +1,117 @@
-"""ギルドごとの非同期音声再生キュー管理"""
+"""ギルドごとの非同期音声再生キュー管理
+
+改善点:
+- 2段キュー構成: TTS合成ジョブキュー → WAV再生キュー
+  再生中に次のメッセージのTTS合成を並走させることでレイテンシを削減
+- BytesIO で直接 FFmpeg に渡すことでテンポラリファイルを廃止
+"""
 
 import asyncio
+import io
 import logging
-import os
-import tempfile
 from dataclasses import dataclass
+from typing import Callable, Awaitable
 
 import discord
 
 logger = logging.getLogger(__name__)
 
+# TTS合成タスクの型: (text, speaker_id, speed) -> bytes を返す非同期関数
+TtsSynthesizer = Callable[[str, int, float], Awaitable[bytes]]
+
+
+@dataclass
+class TtsJob:
+    """TTS合成待ちジョブ"""
+    text: str
+    speaker_id: int
+    speed: float
+    guild_id: int
+    voice_client: discord.VoiceClient
+
 
 @dataclass
 class AudioItem:
+    """再生待ちWAVデータ"""
     wav_bytes: bytes
     guild_id: int
     voice_client: discord.VoiceClient
 
 
 class AudioQueueManager:
-    def __init__(self) -> None:
-        self._queues: dict[int, asyncio.Queue[AudioItem]] = {}
-        self._workers: dict[int, asyncio.Task] = {}
+    def __init__(self, synthesizer: TtsSynthesizer) -> None:
+        """
+        Args:
+            synthesizer: (text, speaker_id, speed) -> wav_bytes を返す非同期関数
+        """
+        self._synthesizer = synthesizer
+        # ギルドIDごとの TTS合成ジョブキュー
+        self._job_queues: dict[int, asyncio.Queue[TtsJob]] = {}
+        # ギルドIDごとの WAV再生キュー
+        self._play_queues: dict[int, asyncio.Queue[AudioItem]] = {}
+        # ギルドIDごとのワーカータスク (合成ワーカー, 再生ワーカー)
+        self._workers: dict[int, tuple[asyncio.Task, asyncio.Task]] = {}
 
-    def get_or_create_queue(self, guild_id: int) -> asyncio.Queue:
-        if guild_id not in self._queues:
-            self._queues[guild_id] = asyncio.Queue()
-            self._workers[guild_id] = asyncio.get_running_loop().create_task(
-                self._worker(guild_id)
-            )
-        return self._queues[guild_id]
+    def _get_or_create_guild(self, guild_id: int) -> None:
+        """ギルド用のキューとワーカーを初期化する（未初期化の場合のみ）"""
+        if guild_id in self._workers:
+            return
+        self._job_queues[guild_id] = asyncio.Queue()
+        self._play_queues[guild_id] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        synth_task = loop.create_task(self._synth_worker(guild_id))
+        play_task = loop.create_task(self._play_worker(guild_id))
+        self._workers[guild_id] = (synth_task, play_task)
 
     async def enqueue(
         self,
         guild_id: int,
-        wav_bytes: bytes,
+        text: str,
+        speaker_id: int,
+        speed: float,
         voice_client: discord.VoiceClient,
     ) -> None:
-        """音声データをキューに追加する"""
-        q = self.get_or_create_queue(guild_id)
-        item = AudioItem(wav_bytes=wav_bytes, guild_id=guild_id, voice_client=voice_client)
-        await q.put(item)
+        """TTS合成ジョブをキューに追加する"""
+        self._get_or_create_guild(guild_id)
+        job = TtsJob(
+            text=text,
+            speaker_id=speaker_id,
+            speed=speed,
+            guild_id=guild_id,
+            voice_client=voice_client,
+        )
+        await self._job_queues[guild_id].put(job)
 
-    async def _worker(self, guild_id: int) -> None:
-        """ギルドのキューを順番に処理するワーカータスク"""
-        q = self._queues[guild_id]
+    async def _synth_worker(self, guild_id: int) -> None:
+        """TTS合成ワーカー: ジョブキューを順番に合成してWAVキューへ積む"""
+        job_queue = self._job_queues[guild_id]
+        play_queue = self._play_queues[guild_id]
         while True:
-            item: AudioItem = await q.get()
+            job: TtsJob = await job_queue.get()
+            try:
+                wav_bytes = await self._synthesizer(job.text, job.speaker_id, job.speed)
+                item = AudioItem(
+                    wav_bytes=wav_bytes,
+                    guild_id=guild_id,
+                    voice_client=job.voice_client,
+                )
+                await play_queue.put(item)
+            except Exception as e:
+                logger.error("TTS合成エラー (guild=%d): %s", guild_id, e)
+            finally:
+                job_queue.task_done()
+
+    async def _play_worker(self, guild_id: int) -> None:
+        """再生ワーカー: WAVキューを順番に再生する"""
+        play_queue = self._play_queues[guild_id]
+        while True:
+            item: AudioItem = await play_queue.get()
             try:
                 await self._play(item)
             except Exception as e:
                 logger.error("音声再生エラー (guild=%d): %s", guild_id, e)
             finally:
-                q.task_done()
+                play_queue.task_done()
 
     async def _play(self, item: AudioItem) -> None:
         """WAVバイト列をボイスチャンネルで再生し、完了まで待機する"""
@@ -60,65 +119,42 @@ class AudioQueueManager:
         if not vc or not vc.is_connected():
             return
 
-        # 再生中の音声がある場合はスキップ（キューで順番制御しているので通常は起きない）
         if vc.is_playing():
             vc.stop()
 
         loop = asyncio.get_running_loop()
         done_event = asyncio.Event()
-        tmp_path: str | None = None
+
+        def after_play(error: Exception | None) -> None:
+            if error:
+                logger.error("FFmpegエラー: %s", error)
+            loop.call_soon_threadsafe(done_event.set)
+
+        # BytesIO で直接渡す（テンポラリファイル不要）
+        buf = io.BytesIO(item.wav_bytes)
+        source = discord.FFmpegPCMAudio(buf, pipe=True)
+        try:
+            vc.play(source, after=after_play)
+        except Exception as e:
+            logger.error("vc.play() に失敗しました (guild=%d): %s", item.guild_id, e)
+            done_event.set()
+            raise
 
         try:
-            # WAVをテンポラリファイルに書き出す
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav", delete=False, prefix="voicebot_"
-            ) as f:
-                f.write(item.wav_bytes)
-                tmp_path = f.name
-
-            def after_play(error: Exception | None) -> None:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                if error:
-                    logger.error("FFmpegエラー: %s", error)
-                loop.call_soon_threadsafe(done_event.set)
-
-            source = discord.FFmpegPCMAudio(tmp_path)
-            try:
-                vc.play(source, after=after_play)
-            except Exception as e:
-                # vc.play() が失敗した場合は after_play が呼ばれないので done_event を自分でセットする
-                logger.error("vc.play() に失敗しました (guild=%d): %s", item.guild_id, e)
-                done_event.set()
-                raise
-
-            # 再生完了を非同期で待機（切断等で after_play が呼ばれない場合のタイムアウト）
-            try:
-                await asyncio.wait_for(done_event.wait(), timeout=60.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "音声再生がタイムアウトしました。スキップします (guild=%d)", item.guild_id
-                )
-
-        except Exception:
-            # テンポラリファイルのクリーンアップ
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            raise
+            await asyncio.wait_for(done_event.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "音声再生がタイムアウトしました。スキップします (guild=%d)", item.guild_id
+            )
 
     def cleanup(self, guild_id: int) -> None:
         """ギルドのキューとワーカータスクを終了する"""
         if guild_id in self._workers:
-            self._workers[guild_id].cancel()
-            del self._workers[guild_id]
-        if guild_id in self._queues:
-            del self._queues[guild_id]
+            synth_task, play_task = self._workers.pop(guild_id)
+            synth_task.cancel()
+            play_task.cancel()
+        self._job_queues.pop(guild_id, None)
+        self._play_queues.pop(guild_id, None)
 
     def cleanup_all(self) -> None:
         """全ギルドのキューとワーカータスクを終了する"""
@@ -126,9 +162,13 @@ class AudioQueueManager:
             self.cleanup(guild_id)
 
     def clear_queue(self, guild_id: int) -> None:
-        """キューに溜まっている未再生の音声をクリアする"""
-        if guild_id in self._queues:
-            q = self._queues[guild_id]
+        """キューに溜まっている未処理の合成ジョブ・未再生の音声をクリアする"""
+        for q in (
+            self._job_queues.get(guild_id),
+            self._play_queues.get(guild_id),
+        ):
+            if q is None:
+                continue
             while not q.empty():
                 try:
                     q.get_nowait()
