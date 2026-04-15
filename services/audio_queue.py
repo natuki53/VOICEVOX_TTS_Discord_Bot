@@ -87,10 +87,21 @@ class AudioQueueManager:
                 loop.call_soon_threadsafe(done_event.set)
 
             source = discord.FFmpegPCMAudio(tmp_path)
-            vc.play(source, after=after_play)
+            try:
+                vc.play(source, after=after_play)
+            except Exception as e:
+                # vc.play() が失敗した場合は after_play が呼ばれないので done_event を自分でセットする
+                logger.error("vc.play() に失敗しました (guild=%d): %s", item.guild_id, e)
+                done_event.set()
+                raise
 
-            # 再生完了を非同期で待機
-            await done_event.wait()
+            # 再生完了を非同期で待機（切断等で after_play が呼ばれない場合のタイムアウト）
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "音声再生がタイムアウトしました。スキップします (guild=%d)", item.guild_id
+                )
 
         except Exception:
             # テンポラリファイルのクリーンアップ

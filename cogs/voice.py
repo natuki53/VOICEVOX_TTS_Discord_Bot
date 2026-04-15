@@ -979,8 +979,8 @@ class VoiceCog(commands.Cog):
                 "https://voicevox.hiroshiba.jp/\n\n"
                 "**VOICEVOX利用規約**\n"
                 "https://voicevox.hiroshiba.jp/term/\n\n"
-                "**話者クレジット（デフォルト互換プリセット）**\n"
-                "`VOICEVOX:ずんだもん`\n\n"
+                "**話者クレジット**\n"
+                "各話者の音声ライブラリ規約を確認し、適切にクレジット表記してください。\n\n"
                 "各話者の利用条件はVOICEVOX公式規約・各音声ライセンスを確認してください。\n\n"
                 "**discord.py** - Discord API ライブラリ\n"
                 "https://github.com/Rapptz/discord.py"
@@ -1045,8 +1045,29 @@ class VoiceCog(commands.Cog):
         if member == self.bot.user:
             if before.channel is not None and after.channel is None:
                 logger.info("BotがVCから切断されました (guild=%d)", guild.id)
+                # TTS通知チャンネルを先に取得してからランタイムをクリアする
+                tts_channel_id = config.TTS_CHANNEL_MAP.get(guild.id)
+                voice_channel_name = before.channel.name
                 self._cancel_idle_disconnect(guild.id)
                 self._clear_guild_runtime(guild.id)
+                # 読み上げチャンネルに強制切断を通知する
+                if tts_channel_id is not None:
+                    tts_channel = guild.get_channel(tts_channel_id)
+                    if isinstance(tts_channel, discord.abc.Messageable):
+                        embed = self._build_notice_embed(
+                            title="ボイスチャンネルから切断されました",
+                            description=(
+                                f"ボイスチャンネル **{voice_channel_name}** から切断されました。\n"
+                                "再び読み上げを開始するには `/join` を実行してください。"
+                            ),
+                            kind="warning",
+                        )
+                        try:
+                            await tts_channel.send(embed=embed)
+                        except discord.HTTPException as e:
+                            logger.warning(
+                                "強制切断通知の送信に失敗しました (guild=%d): %s", guild.id, e
+                            )
             elif after.channel is not None:
                 self._cancel_idle_disconnect(guild.id)
             return

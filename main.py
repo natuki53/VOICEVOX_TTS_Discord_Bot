@@ -1,4 +1,4 @@
-"""Discord ずんだもん読み上げBot - エントリーポイント"""
+"""Discord VOICEVOX読み上げBot - エントリーポイント"""
 
 import asyncio
 import logging
