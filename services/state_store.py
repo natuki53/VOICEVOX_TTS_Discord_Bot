@@ -30,6 +30,36 @@ def _to_int_key_map(data: Any, *, value_cast: type[int] | type[float] = int) -> 
     return result
 
 
+def _to_bool_key_map(data: Any) -> dict[int, bool]:
+    if not isinstance(data, dict):
+        return {}
+
+    result: dict[int, bool] = {}
+    for key, value in data.items():
+        try:
+            int_key = int(key)
+        except (TypeError, ValueError):
+            continue
+
+        if isinstance(value, bool):
+            result[int_key] = value
+            continue
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "on", "yes"}:
+                result[int_key] = True
+                continue
+            if normalized in {"false", "0", "off", "no"}:
+                result[int_key] = False
+                continue
+
+        if isinstance(value, (int, float)):
+            result[int_key] = bool(value)
+
+    return result
+
+
 def _to_nested_int_key_map(data: Any) -> dict[int, dict[int, int]]:
     if not isinstance(data, dict):
         return {}
@@ -48,6 +78,31 @@ def _to_nested_int_key_map(data: Any) -> dict[int, dict[int, int]]:
         for user_id, speaker_id in user_map.items():
             try:
                 casted_user_map[int(user_id)] = int(speaker_id)
+            except (TypeError, ValueError):
+                continue
+        result[int_guild_id] = casted_user_map
+
+    return result
+
+
+def _to_nested_float_key_map(data: Any) -> dict[int, dict[int, float]]:
+    if not isinstance(data, dict):
+        return {}
+
+    result: dict[int, dict[int, float]] = {}
+    for guild_id, user_map in data.items():
+        try:
+            int_guild_id = int(guild_id)
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(user_map, dict):
+            continue
+
+        casted_user_map: dict[int, float] = {}
+        for user_id, speed in user_map.items():
+            try:
+                casted_user_map[int(user_id)] = float(speed)
             except (TypeError, ValueError):
                 continue
         result[int_guild_id] = casted_user_map
@@ -82,8 +137,14 @@ def load_runtime_state() -> None:
     config.GUILD_SPEED_MAP.clear()
     config.GUILD_SPEED_MAP.update(_to_int_key_map(data.get("guild_speed_map"), value_cast=float))
 
+    config.GUILD_USER_SPEED_MAP.clear()
+    config.GUILD_USER_SPEED_MAP.update(_to_nested_float_key_map(data.get("guild_user_speed_map")))
+
     config.GUILD_MAX_LENGTH_MAP.clear()
     config.GUILD_MAX_LENGTH_MAP.update(_to_int_key_map(data.get("guild_max_length_map"), value_cast=int))
+
+    config.GUILD_READ_SENDER_NAME_MAP.clear()
+    config.GUILD_READ_SENDER_NAME_MAP.update(_to_bool_key_map(data.get("guild_read_sender_name_map")))
 
     logger.info("ランタイム状態を復元しました: %s", STATE_FILE_PATH)
 
@@ -98,7 +159,14 @@ def save_runtime_state() -> None:
             for guild_id, user_map in config.GUILD_USER_SPEAKER_MAP.items()
         },
         "guild_speed_map": {str(k): v for k, v in config.GUILD_SPEED_MAP.items()},
+        "guild_user_speed_map": {
+            str(guild_id): {str(user_id): speed for user_id, speed in user_map.items()}
+            for guild_id, user_map in config.GUILD_USER_SPEED_MAP.items()
+        },
         "guild_max_length_map": {str(k): v for k, v in config.GUILD_MAX_LENGTH_MAP.items()},
+        "guild_read_sender_name_map": {
+            str(k): v for k, v in config.GUILD_READ_SENDER_NAME_MAP.items()
+        },
     }
 
     try:

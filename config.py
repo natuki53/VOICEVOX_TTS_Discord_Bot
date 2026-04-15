@@ -42,6 +42,8 @@ else:
 # --- TTS設定 ---
 MAX_TEXT_LENGTH: int = 100  # デフォルト最大文字数（これを超える文字は「以下省略」に切り捨て）
 DEFAULT_SPEED: float = 1.0  # デフォルト読み上げ速度（0.5〜2.0）
+DEFAULT_READ_SENDER_NAME: bool = True  # デフォルトで送信者名を読み上げる
+SENDER_NAME_REPEAT_INTERVAL_SECONDS: int = 60  # 同一送信者の名前を再度読むまでの最小間隔
 
 # --- ランタイム状態（ギルドIDごとに管理） ---
 # guild_id -> text_channel_id: どのテキストchを読み上げ対象にするか
@@ -56,5 +58,11 @@ GUILD_USER_SPEAKER_MAP: dict[int, dict[int, int]] = {}
 # guild_id -> speed: ギルドごとの読み上げ速度
 GUILD_SPEED_MAP: dict[int, float] = {}
 
+# guild_id -> {user_id -> speed}: ユーザー個別の読み上げ速度
+GUILD_USER_SPEED_MAP: dict[int, dict[int, float]] = {}
+
 # guild_id -> max_length: ギルドごとの最大文字数
 GUILD_MAX_LENGTH_MAP: dict[int, int] = {}
+
+# guild_id -> bool: 送信者名を読み上げるか
+GUILD_READ_SENDER_NAME_MAP: dict[int, bool] = {}

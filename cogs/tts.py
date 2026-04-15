@@ -3,6 +3,7 @@
 from collections import Counter
 import logging
 import re
+import time
 
 import discord
 from discord.ext import commands
@@ -94,6 +95,7 @@ def summarize_attachments(attachments: list[discord.Attachment]) -> str:
 class TtsCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._last_sender_by_guild: dict[int, tuple[int, float]] = {}
 
     def _get_connected_vc(self, guild: discord.Guild) -> discord.VoiceClient | None:
         """接続済みVoiceClientを返す（未接続の古い参照は無視）。"""
@@ -109,6 +111,20 @@ class TtsCog(commands.Cog):
             ):
                 return candidate
         return None
+
+    def _should_prepend_sender_name(self, guild_id: int, user_id: int) -> bool:
+        now = time.monotonic()
+        last_sender = self._last_sender_by_guild.get(guild_id)
+        self._last_sender_by_guild[guild_id] = (user_id, now)
+
+        if last_sender is None:
+            return True
+
+        last_user_id, last_message_at = last_sender
+        if last_user_id != user_id:
+            return True
+
+        return (now - last_message_at) >= config.SENDER_NAME_REPEAT_INTERVAL_SECONDS
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -152,9 +168,15 @@ class TtsCog(commands.Cog):
         if not read_parts:
             return
 
-        # ユーザー名を冒頭に付与
-        display_name = message.author.display_name
-        read_text = f"{display_name}。{'。'.join(read_parts)}"
+        read_sender_name = config.GUILD_READ_SENDER_NAME_MAP.get(
+            guild.id,
+            config.DEFAULT_READ_SENDER_NAME,
+        )
+        if read_sender_name and self._should_prepend_sender_name(guild.id, message.author.id):
+            display_name = message.author.display_name
+            read_text = f"{display_name}。{'。'.join(read_parts)}"
+        else:
+            read_text = "。".join(read_parts)
 
         # --- TTS合成ジョブをキューに追加（合成は再生ワーカーと並走） ---
         user_speakers = config.GUILD_USER_SPEAKER_MAP.get(guild.id, {})
@@ -162,7 +184,11 @@ class TtsCog(commands.Cog):
             message.author.id,
             config.GUILD_SPEAKER_MAP.get(guild.id, config.DEFAULT_SPEAKER_ID),
         )
-        speed = config.GUILD_SPEED_MAP.get(guild.id, config.DEFAULT_SPEED)
+        user_speeds = config.GUILD_USER_SPEED_MAP.get(guild.id, {})
+        speed = user_speeds.get(
+            message.author.id,
+            config.GUILD_SPEED_MAP.get(guild.id, config.DEFAULT_SPEED),
+        )
         try:
             await self.bot.audio_queue.enqueue(guild.id, read_text, speaker_id, speed, vc)
         except Exception as e:

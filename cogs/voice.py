@@ -1,4 +1,4 @@
-"""ボイスチャンネル管理Cog - /join, /leave, /speaker, /speakerall, /style, /styleall, /speed, /maxlength, /status + 入退室アナウンス"""
+"""ボイスチャンネル管理Cog - /join, /leave, /speaker, /speakerall, /style, /styleall, /speed, /maxlength, /readname, /status + 入退室アナウンス"""
 
 import asyncio
 import logging
@@ -22,6 +22,10 @@ STYLE_CHOICES = [
     app_commands.Choice(name="あまあま", value="amaama"),
     app_commands.Choice(name="ツンツン", value="tsuntsun"),
     app_commands.Choice(name="セクシー", value="sexy"),
+]
+READ_NAME_CHOICES = [
+    app_commands.Choice(name="読む", value="on"),
+    app_commands.Choice(name="読まない", value="off"),
 ]
 STYLE_NAMES = {
     "normal": "ノーマル",
@@ -193,8 +197,23 @@ class VoiceCog(commands.Cog):
     def _persist_runtime_state(self) -> None:
         save_runtime_state()
 
-    def _get_speed(self, guild_id: int) -> float:
+    def _get_speed(self, guild_id: int, user_id: int | None = None) -> float:
+        if user_id is not None:
+            user_speeds = config.GUILD_USER_SPEED_MAP.get(guild_id, {})
+            if user_id in user_speeds:
+                return user_speeds[user_id]
         return config.GUILD_SPEED_MAP.get(guild_id, config.DEFAULT_SPEED)
+
+    def _set_user_speed(self, guild_id: int, user_id: int, speed: float) -> None:
+        user_speeds = config.GUILD_USER_SPEED_MAP.setdefault(guild_id, {})
+        user_speeds[user_id] = speed
+        self._persist_runtime_state()
+
+    def _get_read_sender_name_enabled(self, guild_id: int) -> bool:
+        return config.GUILD_READ_SENDER_NAME_MAP.get(
+            guild_id,
+            config.DEFAULT_READ_SENDER_NAME,
+        )
 
     async def _refresh_speaker_cache(self, *, force: bool = False) -> None:
         if self.bot.voicevox is None:
@@ -300,7 +319,9 @@ class VoiceCog(commands.Cog):
         config.GUILD_SPEAKER_MAP.pop(guild_id, None)
         config.GUILD_USER_SPEAKER_MAP.pop(guild_id, None)
         config.GUILD_SPEED_MAP.pop(guild_id, None)
+        config.GUILD_USER_SPEED_MAP.pop(guild_id, None)
         config.GUILD_MAX_LENGTH_MAP.pop(guild_id, None)
+        config.GUILD_READ_SENDER_NAME_MAP.pop(guild_id, None)
         self._persist_runtime_state()
 
     def _cancel_idle_disconnect(self, guild_id: int) -> None:
@@ -573,6 +594,7 @@ class VoiceCog(commands.Cog):
         speaker_display = self._get_speaker_display_name(speaker_id)
         speed = self._get_speed(guild.id)
         max_length = config.GUILD_MAX_LENGTH_MAP.get(guild.id, config.MAX_TEXT_LENGTH)
+        read_name = "読む" if self._get_read_sender_name_enabled(guild.id) else "読まない"
 
         title = "ボイスチャンネルを移動しました" if moved else "ボイスチャンネルに接続しました"
         embed = self._build_notice_embed(title=title, kind="success")
@@ -581,6 +603,7 @@ class VoiceCog(commands.Cog):
         embed.add_field(name="話者", value=speaker_display, inline=True)
         embed.add_field(name="読み上げ速度", value=str(speed), inline=True)
         embed.add_field(name="最大文字数", value=f"{max_length}文字", inline=True)
+        embed.add_field(name="送信者名読み上げ", value=read_name, inline=True)
 
         await self._send_once(interaction, embed=embed)
         await self._speak("移動しました。" if moved else "接続しました。", guild, vc)
@@ -700,7 +723,6 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="speakerall", description="サーバー全体のデフォルト話者を変更します")
     @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(speaker="全体デフォルト話者を選んでください（候補から選択）")
     @app_commands.autocomplete(speaker=speaker_autocomplete)
     async def speakerall(self, interaction: discord.Interaction, speaker: str) -> None:
@@ -821,7 +843,6 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="styleall", description="サーバー全体のデフォルト声スタイル（互換プリセット）を変更します")
     @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(style="全体デフォルトの互換プリセットを選んでください")
     @app_commands.choices(style=STYLE_CHOICES)
     async def styleall(self, interaction: discord.Interaction, style: str) -> None:
@@ -879,7 +900,47 @@ class VoiceCog(commands.Cog):
             speaker_id=speaker_id,
         )
 
-    @app_commands.command(name="speed", description="読み上げ速度を変更します（0.5〜2.0、デフォルト: 1.0）")
+    @app_commands.command(name="speedall", description="サーバー全体の読み上げ速度を変更します（0.5〜2.0、デフォルト: 1.0）")
+    @app_commands.guild_only()
+    @app_commands.describe(value="読み上げ速度（0.5=ゆっくり / 1.0=普通 / 2.0=はやい）")
+    async def speedall(self, interaction: discord.Interaction, value: float) -> None:
+        guild = await self._ensure_guild(interaction)
+        if guild is None:
+            return
+
+        vc = await self._get_or_recover_vc(guild)
+        if not vc:
+            await self._send_notice(
+                interaction,
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
+                ephemeral=True,
+            )
+            return
+
+        if not (0.5 <= value <= 2.0):
+            await self._send_notice(
+                interaction,
+                title="速度の指定が範囲外です",
+                description="0.5〜2.0 の範囲で指定してください。",
+                kind="error",
+                ephemeral=True,
+            )
+            return
+
+        config.GUILD_SPEED_MAP[guild.id] = value
+        self._persist_runtime_state()
+        user_speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
+        await self._send_notice(
+            interaction,
+            title="全体読み上げ速度を変更しました",
+            description=f"現在の全体速度: **{value}**",
+            kind="success",
+        )
+        await self._speak(f"全体の読み上げ速度を {value} に変更しました。", guild, vc, speaker_id=user_speaker_id)
+
+    @app_commands.command(name="speed", description="あなたの読み上げ速度を変更します（0.5〜2.0、デフォルト: サーバー設定）")
     @app_commands.guild_only()
     @app_commands.describe(value="読み上げ速度（0.5=ゆっくり / 1.0=普通 / 2.0=はやい）")
     async def speed(self, interaction: discord.Interaction, value: float) -> None:
@@ -908,16 +969,16 @@ class VoiceCog(commands.Cog):
             )
             return
 
-        config.GUILD_SPEED_MAP[guild.id] = value
-        self._persist_runtime_state()
-        message = f"読み上げ速度を {value} に変更しました。"
+        self._set_user_speed(guild.id, interaction.user.id, value)
+        user_name = interaction.user.display_name
+        user_speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
         await self._send_notice(
             interaction,
-            title="読み上げ速度を変更しました",
-            description=f"現在の速度: **{value}**",
+            title=f"{user_name}の読み上げ速度を変更しました",
+            description=f"現在の{user_name}の速度: **{value}**",
             kind="success",
         )
-        await self._speak(message, guild, vc)
+        await self._speak(f"{user_name}の読み上げ速度を {value} に変更しました。", guild, vc, speaker_id=user_speaker_id)
 
     @app_commands.command(name="maxlength", description="読み上げる最大文字数を変更します（10〜500）")
     @app_commands.guild_only()
@@ -957,6 +1018,48 @@ class VoiceCog(commands.Cog):
             kind="success",
         )
 
+    @app_commands.command(
+        name="readname",
+        description="送信者名を読み上げるかどうかを変更します",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(mode="送信者名を読むかどうか")
+    @app_commands.choices(mode=READ_NAME_CHOICES)
+    async def readname(self, interaction: discord.Interaction, mode: str) -> None:
+        guild = await self._ensure_guild(interaction)
+        if guild is None:
+            return
+
+        vc = await self._get_or_recover_vc(guild)
+        if not vc:
+            await self._send_notice(
+                interaction,
+                title="読み上げ中ではありません",
+                description="先に /join を実行してください。",
+                kind="warning",
+                ephemeral=True,
+            )
+            return
+
+        enabled = mode == "on"
+        config.GUILD_READ_SENDER_NAME_MAP[guild.id] = enabled
+        self._persist_runtime_state()
+
+        status_text = "読む" if enabled else "読まない"
+        user_speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
+        await self._send_notice(
+            interaction,
+            title="送信者名読み上げを変更しました",
+            description=f"現在の設定: **{status_text}**",
+            kind="success",
+        )
+        await self._speak(
+            f"送信者名の読み上げを{status_text}設定にしました。",
+            guild,
+            vc,
+            speaker_id=user_speaker_id,
+        )
+
     @app_commands.command(name="about", description="このBotについての情報を表示します")
     async def about(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
@@ -966,7 +1069,7 @@ class VoiceCog(commands.Cog):
         )
         embed.add_field(
             name="使い方",
-            value="`/join` → ボイスチャンネルに参加\n`/leave` → 退出\n`/speaker` → あなたの話者変更\n`/speakerall` → 全体デフォルト話者変更\n`/style` → あなたの互換スタイル変更\n`/styleall` → 全体デフォルト互換スタイル変更\n`/speed` → 速度変更\n`/maxlength` → 最大文字数変更\n`/status` → 現在の設定確認",
+            value="`/join` → ボイスチャンネルに参加\n`/leave` → 退出\n`/speaker` → あなたの話者変更\n`/speakerall` → 全体デフォルト話者変更\n`/style` → あなたの互換スタイル変更\n`/styleall` → 全体デフォルト互換スタイル変更\n`/speed` → あなたの速度変更\n`/speedall` → 全体速度変更\n`/maxlength` → 最大文字数変更\n`/readname` → 送信者名読み上げ切替\n`/status` → 現在の設定確認",
             inline=False,
         )
         embed.add_field(
@@ -1008,21 +1111,29 @@ class VoiceCog(commands.Cog):
         channel_mention = f"<#{channel_id}>" if channel_id else "未設定"
 
         await self._refresh_speaker_cache()
-        speaker_id = self._get_user_speaker_id(guild.id, interaction.user.id)
+        user_id = interaction.user.id
+        speaker_id = self._get_user_speaker_id(guild.id, user_id)
         default_speaker_id = self._get_speaker_id(guild.id)
         speaker_display = self._get_speaker_display_name(speaker_id)
         default_speaker_display = self._get_speaker_display_name(default_speaker_id)
 
-        speed = self._get_speed(guild.id)
+        guild_speed = self._get_speed(guild.id)
+        user_speed = self._get_speed(guild.id, user_id)
+        user_speeds = config.GUILD_USER_SPEED_MAP.get(guild.id, {})
+        has_user_speed = user_id in user_speeds
         max_length = config.GUILD_MAX_LENGTH_MAP.get(guild.id, config.MAX_TEXT_LENGTH)
+        read_name = "読む" if self._get_read_sender_name_enabled(guild.id) else "読まない"
 
         embed = self._build_notice_embed(title="現在の状態", kind="info")
         embed.add_field(name="ボイスチャンネル", value=vc.channel.name, inline=False)
         embed.add_field(name="読み上げチャンネル", value=channel_mention, inline=False)
         embed.add_field(name="あなたの話者", value=speaker_display, inline=True)
         embed.add_field(name="全体デフォルト話者", value=default_speaker_display, inline=True)
-        embed.add_field(name="読み上げ速度", value=str(speed), inline=True)
+        speed_value = f"{user_speed}（個人設定）" if has_user_speed else f"{guild_speed}（全体設定）"
+        embed.add_field(name="あなたの読み上げ速度", value=speed_value, inline=True)
+        embed.add_field(name="全体読み上げ速度", value=str(guild_speed), inline=True)
         embed.add_field(name="最大文字数", value=f"{max_length}文字", inline=True)
+        embed.add_field(name="送信者名読み上げ", value=read_name, inline=True)
 
         await self._send_once(interaction, embed=embed)
 
