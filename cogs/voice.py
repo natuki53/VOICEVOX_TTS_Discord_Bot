@@ -15,6 +15,8 @@ from services.voicevox import VoicevoxError
 logger = logging.getLogger(__name__)
 
 IDLE_DISCONNECT_SECONDS = 60
+IDLE_DISCONNECT_RECHECK_DELAY_SECONDS = 3
+VOICE_RECONNECT_GRACE_SECONDS = 10
 MAX_AUTOCOMPLETE_CHOICES = 25
 SPEAKER_CACHE_TTL_SECONDS = 60
 STYLE_CHOICES = [
@@ -51,6 +53,7 @@ class VoiceCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
+        self._bot_disconnect_grace_tasks: dict[int, asyncio.Task[None]] = {}
         self._speaker_label_cache: dict[int, str] = {}
         self._speaker_options_cache: list[tuple[int, str]] = []
         self._speaker_cache_updated_at = 0.0
@@ -81,6 +84,10 @@ class VoiceCog(commands.Cog):
             if not task.done():
                 task.cancel()
         self._idle_disconnect_tasks.clear()
+        for task in self._bot_disconnect_grace_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._bot_disconnect_grace_tasks.clear()
 
     # -----------------------------------------------------------------------
     # ユーティリティ
@@ -311,7 +318,22 @@ class VoiceCog(commands.Cog):
         self,
         channel: discord.VoiceChannel | discord.StageChannel,
     ) -> bool:
-        return any(not member.bot for member in channel.members)
+        """VCに人間メンバーがいるかを判定する。
+
+        channel.members のほか、guild 全体のメンバーの voice state も走査して
+        キャッシュずれによる誤判定を防ぐ。
+        """
+        if any(not member.bot for member in channel.members):
+            return True
+
+        guild = channel.guild
+        for member in guild.members:
+            if member.bot:
+                continue
+            voice_state = member.voice
+            if voice_state is not None and voice_state.channel == channel:
+                return True
+        return False
 
     def _clear_guild_runtime(self, guild_id: int) -> None:
         self.bot.audio_queue.cleanup(guild_id)
@@ -443,6 +465,76 @@ class VoiceCog(commands.Cog):
             self._idle_disconnect_after_delay(guild_id)
         )
 
+    def _cancel_bot_disconnect_grace(self, guild_id: int) -> None:
+        task = self._bot_disconnect_grace_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_bot_disconnect_grace(
+        self,
+        guild: discord.Guild,
+        voice_channel_name: str,
+    ) -> None:
+        guild_id = guild.id
+        self._cancel_bot_disconnect_grace(guild_id)
+        self._bot_disconnect_grace_tasks[guild_id] = asyncio.create_task(
+            self._confirm_bot_disconnect_after_delay(guild_id, voice_channel_name)
+        )
+
+    async def _confirm_bot_disconnect_after_delay(
+        self,
+        guild_id: int,
+        voice_channel_name: str,
+    ) -> None:
+        """Bot切断の猶予後、本当に切断されていればランタイムをクリアし通知する。"""
+        try:
+            await asyncio.sleep(VOICE_RECONNECT_GRACE_SECONDS)
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+
+            # 猶予後に再接続されていれば何もしない（voice server update 等での一時的な切断）
+            vc = self._get_connected_vc(guild)
+            if vc:
+                logger.info(
+                    "Bot切断は一時的なものでした。読み上げを継続します (guild=%d)",
+                    guild_id,
+                )
+                return
+
+            logger.info("BotがVCから切断されました (guild=%d)", guild_id)
+            tts_channel_id = config.TTS_CHANNEL_MAP.get(guild_id)
+            self._cancel_idle_disconnect(guild_id)
+            self._clear_guild_runtime(guild_id)
+
+            if tts_channel_id is not None:
+                tts_channel = guild.get_channel(tts_channel_id)
+                if isinstance(tts_channel, discord.abc.Messageable):
+                    embed = self._build_notice_embed(
+                        title="ボイスチャンネルから切断されました",
+                        description=(
+                            f"ボイスチャンネル **{voice_channel_name}** から切断されました。\n"
+                            "再び読み上げを開始するには `/join` を実行してください。"
+                        ),
+                        kind="warning",
+                    )
+                    try:
+                        await tts_channel.send(embed=embed)
+                    except discord.HTTPException as e:
+                        logger.warning(
+                            "強制切断通知の送信に失敗しました (guild=%d): %s", guild_id, e
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Bot切断確認タスクでエラーが発生しました (guild=%d): %s", guild_id, e
+            )
+        finally:
+            task = self._bot_disconnect_grace_tasks.get(guild_id)
+            if task is asyncio.current_task():
+                self._bot_disconnect_grace_tasks.pop(guild_id, None)
+
     async def _idle_disconnect_after_delay(self, guild_id: int) -> None:
         try:
             await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
@@ -455,6 +547,19 @@ class VoiceCog(commands.Cog):
                 return
 
             if self._has_human_member(vc.channel):
+                return
+
+            # voice_state_update の瞬断で誤って無人判定になることがあるため、
+            # 少し待ってからもう一度確認する
+            await asyncio.sleep(IDLE_DISCONNECT_RECHECK_DELAY_SECONDS)
+            vc = self._get_connected_vc(guild)
+            if not vc:
+                return
+            if self._has_human_member(vc.channel):
+                logger.debug(
+                    "VC無人判定を再確認したところ人間メンバーを検出したため自動切断を取りやめます (guild=%d)",
+                    guild_id,
+                )
                 return
 
             logger.info(
@@ -651,6 +756,9 @@ class VoiceCog(commands.Cog):
             await vc.disconnect()
         except Exception as e:
             logger.warning("VC切断時にエラーが発生しました (guild=%d): %s", guild.id, e)
+
+        # disconnect() により on_voice_state_update 経由で猶予タスクが発火しうるため明示的にキャンセル
+        self._cancel_bot_disconnect_grace(guild.id)
 
         await self._send_once(
             interaction,
@@ -1152,31 +1260,17 @@ class VoiceCog(commands.Cog):
 
         if member == self.bot.user:
             if before.channel is not None and after.channel is None:
-                logger.info("BotがVCから切断されました (guild=%d)", guild.id)
-                # TTS通知チャンネルを先に取得してからランタイムをクリアする
-                tts_channel_id = config.TTS_CHANNEL_MAP.get(guild.id)
-                voice_channel_name = before.channel.name
-                self._cancel_idle_disconnect(guild.id)
-                self._clear_guild_runtime(guild.id)
-                # 読み上げチャンネルに強制切断を通知する
-                if tts_channel_id is not None:
-                    tts_channel = guild.get_channel(tts_channel_id)
-                    if isinstance(tts_channel, discord.abc.Messageable):
-                        embed = self._build_notice_embed(
-                            title="ボイスチャンネルから切断されました",
-                            description=(
-                                f"ボイスチャンネル **{voice_channel_name}** から切断されました。\n"
-                                "再び読み上げを開始するには `/join` を実行してください。"
-                            ),
-                            kind="warning",
-                        )
-                        try:
-                            await tts_channel.send(embed=embed)
-                        except discord.HTTPException as e:
-                            logger.warning(
-                                "強制切断通知の送信に失敗しました (guild=%d): %s", guild.id, e
-                            )
+                logger.info(
+                    "BotがVCから一時切断された可能性があります。%d秒の猶予後に確認します (guild=%d)",
+                    VOICE_RECONNECT_GRACE_SECONDS,
+                    guild.id,
+                )
+                # voice server update による瞬断と永続的な切断を区別するため、
+                # 即時にランタイムをクリアせず猶予タスクで確認する
+                self._schedule_bot_disconnect_grace(guild, before.channel.name)
             elif after.channel is not None:
+                # 再接続または移動した場合は猶予タスクをキャンセルして復帰扱いにする
+                self._cancel_bot_disconnect_grace(guild.id)
                 self._cancel_idle_disconnect(guild.id)
             return
 

@@ -4,7 +4,9 @@ from typing import Any
 
 import aiohttp
 
-TIMEOUT = aiohttp.ClientTimeout(total=10)
+QUERY_TIMEOUT = aiohttp.ClientTimeout(total=30)
+SYNTHESIS_TIMEOUT = aiohttp.ClientTimeout(total=60)
+META_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 class VoicevoxError(Exception):
@@ -20,7 +22,7 @@ class VoicevoxClient:
         """テキストからAudioQueryを生成する"""
         url = f"{self._base_url}/audio_query"
         params = {"text": text, "speaker": speaker_id}
-        async with self._session.post(url, params=params, timeout=TIMEOUT) as resp:
+        async with self._session.post(url, params=params, timeout=QUERY_TIMEOUT) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise VoicevoxError(
@@ -34,7 +36,7 @@ class VoicevoxClient:
         params = {"speaker": speaker_id}
         headers = {"Content-Type": "application/json"}
         async with self._session.post(
-            url, params=params, json=query, headers=headers, timeout=TIMEOUT
+            url, params=params, json=query, headers=headers, timeout=SYNTHESIS_TIMEOUT
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -52,7 +54,7 @@ class VoicevoxClient:
     async def list_speakers(self) -> list[dict[str, Any]]:
         """利用可能な話者・スタイル一覧を取得する"""
         url = f"{self._base_url}/speakers"
-        async with self._session.get(url, timeout=TIMEOUT) as resp:
+        async with self._session.get(url, timeout=META_TIMEOUT) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise VoicevoxError(
@@ -67,7 +69,7 @@ class VoicevoxClient:
         """VOICEVOX Engineが起動しているか確認する"""
         try:
             url = f"{self._base_url}/version"
-            async with self._session.get(url, timeout=TIMEOUT) as resp:
+            async with self._session.get(url, timeout=META_TIMEOUT) as resp:
                 return resp.status == 200
         except Exception:
             return False

@@ -89,7 +89,13 @@ class AudioQueueManager:
         while True:
             job: TtsJob = await job_queue.get()
             try:
+                # 合成前にVoiceClientがまだ生きているか確認
+                if not job.voice_client or not job.voice_client.is_connected():
+                    continue
                 wav_bytes = await self._synthesizer(job.text, job.speaker_id, job.speed)
+                # 合成完了時にVoiceClientがまだ生きているか再確認（合成中に切断された可能性）
+                if not job.voice_client.is_connected():
+                    continue
                 item = AudioItem(
                     wav_bytes=wav_bytes,
                     guild_id=guild_id,
@@ -146,6 +152,12 @@ class AudioQueueManager:
             logger.warning(
                 "音声再生がタイムアウトしました。スキップします (guild=%d)", item.guild_id
             )
+            # タイムアウト時はFFmpegプロセスを確実に停止してリソースを解放する
+            try:
+                if vc.is_connected() and vc.is_playing():
+                    vc.stop()
+            except Exception as e:
+                logger.debug("タイムアウト後のvc.stop()でエラー (guild=%d): %s", item.guild_id, e)
 
     def cleanup(self, guild_id: int) -> None:
         """ギルドのキューとワーカータスクを終了する"""

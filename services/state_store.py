@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,8 @@ import config
 logger = logging.getLogger(__name__)
 
 STATE_FILE_PATH = Path(os.getenv("RUNTIME_STATE_FILE", "data/runtime_state.json"))
+
+_save_lock = threading.Lock()
 
 
 def _to_int_key_map(data: Any, *, value_cast: type[int] | type[float] = int) -> dict[int, Any]:
@@ -149,9 +153,8 @@ def load_runtime_state() -> None:
     logger.info("ランタイム状態を復元しました: %s", STATE_FILE_PATH)
 
 
-def save_runtime_state() -> None:
-    """configのランタイムマップをJSONへ保存する。"""
-    data = {
+def _snapshot_runtime_state() -> dict[str, Any]:
+    return {
         "tts_channel_map": {str(k): v for k, v in config.TTS_CHANNEL_MAP.items()},
         "guild_speaker_map": {str(k): v for k, v in config.GUILD_SPEAKER_MAP.items()},
         "guild_user_speaker_map": {
@@ -169,13 +172,33 @@ def save_runtime_state() -> None:
         },
     }
 
+
+def _write_state_sync(data: dict[str, Any]) -> None:
+    with _save_lock:
+        try:
+            STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = STATE_FILE_PATH.with_suffix(".tmp")
+            temp_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            temp_path.replace(STATE_FILE_PATH)
+        except Exception as e:
+            logger.warning("ランタイム状態の保存に失敗しました: %s", e)
+
+
+def save_runtime_state() -> None:
+    """configのランタイムマップをJSONへ保存する。
+
+    イベントループ内から呼ばれた場合は同期I/Oでループをブロックしないよう
+    別スレッドに逃がす。ループ外（起動時/終了時）では同期的に書き込む。
+    """
+    data = _snapshot_runtime_state()
+
     try:
-        STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = STATE_FILE_PATH.with_suffix(".tmp")
-        temp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temp_path.replace(STATE_FILE_PATH)
-    except Exception as e:
-        logger.warning("ランタイム状態の保存に失敗しました: %s", e)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write_state_sync(data)
+        return
+
+    loop.run_in_executor(None, _write_state_sync, data)
