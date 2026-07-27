@@ -335,15 +335,10 @@ class VoiceCog(commands.Cog):
                 return True
         return False
 
-    def _clear_guild_runtime(self, guild_id: int) -> None:
+    def _clear_guild_session(self, guild_id: int) -> None:
+        """VC接続にだけ紐づく状態を破棄し、読み上げ設定は保持する。"""
         self.bot.audio_queue.cleanup(guild_id)
         config.TTS_CHANNEL_MAP.pop(guild_id, None)
-        config.GUILD_SPEAKER_MAP.pop(guild_id, None)
-        config.GUILD_USER_SPEAKER_MAP.pop(guild_id, None)
-        config.GUILD_SPEED_MAP.pop(guild_id, None)
-        config.GUILD_USER_SPEED_MAP.pop(guild_id, None)
-        config.GUILD_MAX_LENGTH_MAP.pop(guild_id, None)
-        config.GUILD_READ_SENDER_NAME_MAP.pop(guild_id, None)
         self._persist_runtime_state()
 
     def _cancel_idle_disconnect(self, guild_id: int) -> None:
@@ -505,7 +500,7 @@ class VoiceCog(commands.Cog):
             logger.info("BotがVCから切断されました (guild=%d)", guild_id)
             tts_channel_id = config.TTS_CHANNEL_MAP.get(guild_id)
             self._cancel_idle_disconnect(guild_id)
-            self._clear_guild_runtime(guild_id)
+            self._clear_guild_session(guild_id)
 
             if tts_channel_id is not None:
                 tts_channel = guild.get_channel(tts_channel_id)
@@ -587,7 +582,7 @@ class VoiceCog(commands.Cog):
 
             await vc.disconnect()
             if not vc.is_connected():
-                self._clear_guild_runtime(guild_id)
+                self._clear_guild_session(guild_id)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -726,7 +721,7 @@ class VoiceCog(commands.Cog):
         vc = await self._get_or_recover_vc(guild)
         if not vc:
             self._cancel_idle_disconnect(guild.id)
-            self._clear_guild_runtime(guild.id)
+            self._clear_guild_session(guild.id)
             await self._send_notice(
                 interaction,
                 title="すでに切断済みです",
@@ -740,17 +735,24 @@ class VoiceCog(commands.Cog):
             guild.id,
             interaction.channel_id,
         )
+
+        # 退出処理中に新しいメッセージがキューへ追加されないよう、先に
+        # 読み上げ対象チャンネルを無効化する。
+        config.TTS_CHANNEL_MAP.pop(guild.id, None)
         await self._speak("切断します。またね。", guild, vc)
 
-        try:
-            q = self.bot.audio_queue._play_queues.get(guild.id)
-            if q:
-                await asyncio.wait_for(q.join(), timeout=3.0)
-        except asyncio.TimeoutError:
-            pass
+        drained = await self.bot.audio_queue.wait_until_idle(
+            guild.id,
+            timeout=10.0,
+        )
+        if not drained:
+            logger.warning(
+                "退出前の音声キュー待機がタイムアウトしました (guild=%d)",
+                guild.id,
+            )
 
         self._cancel_idle_disconnect(guild.id)
-        self._clear_guild_runtime(guild.id)
+        self._clear_guild_session(guild.id)
 
         try:
             await vc.disconnect()
@@ -831,6 +833,8 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="speakerall", description="サーバー全体のデフォルト話者を変更します")
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(speaker="全体デフォルト話者を選んでください（候補から選択）")
     @app_commands.autocomplete(speaker=speaker_autocomplete)
     async def speakerall(self, interaction: discord.Interaction, speaker: str) -> None:
@@ -951,6 +955,8 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="styleall", description="サーバー全体のデフォルト声スタイル（互換プリセット）を変更します")
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(style="全体デフォルトの互換プリセットを選んでください")
     @app_commands.choices(style=STYLE_CHOICES)
     async def styleall(self, interaction: discord.Interaction, style: str) -> None:
@@ -1010,6 +1016,8 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="speedall", description="サーバー全体の読み上げ速度を変更します（0.5〜2.0、デフォルト: 1.0）")
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(value="読み上げ速度（0.5=ゆっくり / 1.0=普通 / 2.0=はやい）")
     async def speedall(self, interaction: discord.Interaction, value: float) -> None:
         guild = await self._ensure_guild(interaction)
@@ -1090,6 +1098,8 @@ class VoiceCog(commands.Cog):
 
     @app_commands.command(name="maxlength", description="読み上げる最大文字数を変更します（10〜500）")
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(length="最大文字数（デフォルト: 100）")
     async def maxlength(self, interaction: discord.Interaction, length: int) -> None:
         guild = await self._ensure_guild(interaction)
@@ -1131,6 +1141,8 @@ class VoiceCog(commands.Cog):
         description="送信者名を読み上げるかどうかを変更します",
     )
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(mode="送信者名を読むかどうか")
     @app_commands.choices(mode=READ_NAME_CHOICES)
     async def readname(self, interaction: discord.Interaction, mode: str) -> None:

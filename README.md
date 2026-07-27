@@ -23,12 +23,13 @@ Discord のテキストチャンネルを、VOICEVOXで読み上げる Bot で�
 | `/join` | Bot を VC に参加させ、現在のテキストチャンネルを読み上げ対象に設定 |
 | `/leave` | VC から退出し、読み上げ停止 |
 | `/speaker` | あなたの話者変更（インストール済み話者から選択） |
-| `/speakerall` | サーバー全体デフォルト話者変更（要 `Manage Server`） |
+| `/speakerall` | サーバー全体デフォルト話者変更（要「サーバーの管理」） |
 | `/style` | あなたの互換声スタイル変更（`normal` / `amaama` / `tsuntsun` / `sexy`） |
-| `/styleall` | サーバー全体デフォルト互換声スタイル変更（要 `Manage Server`） |
+| `/styleall` | サーバー全体デフォルト互換声スタイル変更（要「サーバーの管理」） |
 | `/speed <value>` | 読み上げ速度変更（`0.5`〜`2.0`） |
-| `/maxlength <length>` | 最大読み上げ文字数変更（`10`〜`500`） |
-| `/readname <mode>` | 送信者名を読むかどうかを切り替え（`読む` / `読まない`） |
+| `/speedall <value>` | サーバー全体の読み上げ速度変更（要「サーバーの管理」） |
+| `/maxlength <length>` | 最大読み上げ文字数変更（要「サーバーの管理」） |
+| `/readname <mode>` | 送信者名を切り替え（要「サーバーの管理」） |
 | `/status` | 現在の設定確認 |
 | `/about` | Bot 情報表示 |
 
@@ -130,6 +131,11 @@ copy .env.example .env
 | `DEFAULT_SPEAKER_STYLE` | 旧互換: 初期声スタイル | `normal` |
 | `COMMAND_GUILD_ID` | 指定サーバーでスラッシュコマンドを即時同期（開発向け） | `123456789012345678` |
 | `RUNTIME_STATE_FILE` | 設定保存先JSONパス（任意） | `data/runtime_state.json` |
+| `TTS_JOB_QUEUE_MAX_SIZE` | ギルドごとの未合成メッセージ上限 | `100` |
+| `AUDIO_QUEUE_MAX_SIZE` | ギルドごとの合成済み音声上限 | `20` |
+| `BOT_LOG_FILE` | ローテーション付きログ保存先（任意） | `data/logs/voicebot.log` |
+| `BOT_LOG_MAX_BYTES` | ログ1ファイルの最大サイズ | `10485760` |
+| `BOT_LOG_BACKUP_COUNT` | 保持するバックアップログ数 | `5` |
 
 ## 起動方法
 
@@ -182,11 +188,13 @@ journalctl -u voicebot -f
 `.env` の `VOICEVOX_URL` を `http://voicevox:50021` に設定してから起動します。
 
 ```bash
+docker volume create voicevox-tts-discord-bot-data
 docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Botのランタイム設定は `voicevox-tts-discord-bot-data` ボリュームへ保存されます。
+Botのランタイム設定とローテーションログは
+`voicevox-tts-discord-bot-data` ボリュームへ保存されます。
 
 ## GitHub Webhookによる自動更新
 

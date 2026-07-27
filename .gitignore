@@ -24,6 +24,7 @@ build/
 # 永続化されたランタイム設定
 data/runtime_state.json
 data/*.tmp
+data/logs/
 
 # VOICEVOX Engine ローカルバイナリ（必要なら別途配布）
 macos-arm64/

@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import aiohttp
 import discord
@@ -11,15 +14,51 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from services.voicevox import VoicevoxClient
 from services.audio_queue import AudioQueueManager
 from services.state_store import load_runtime_state, save_runtime_state
+from services.voicevox import VoicevoxClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+def configure_logging() -> str | None:
+    """標準出力に加え、指定時はローテーション付きファイルへも記録する。"""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_file = os.getenv("BOT_LOG_FILE")
+    file_error: str | None = None
+
+    if log_file:
+        try:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            max_bytes = max(1, int(os.getenv("BOT_LOG_MAX_BYTES", "10485760")))
+            backup_count = max(1, int(os.getenv("BOT_LOG_BACKUP_COUNT", "5")))
+            handlers.append(
+                RotatingFileHandler(
+                    log_path,
+                    maxBytes=max_bytes,
+                    backupCount=backup_count,
+                    encoding="utf-8",
+                )
+            )
+            try:
+                log_path.chmod(0o600)
+            except OSError:
+                pass
+        except (OSError, ValueError) as e:
+            file_error = str(e)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    return file_error
+
+
+_logging_file_error = configure_logging()
 logger = logging.getLogger(__name__)
+if _logging_file_error:
+    logger.warning("ファイルログを初期化できませんでした: %s", _logging_file_error)
 
 RETRYABLE_DISCORD_ERRORS = (
     aiohttp.ClientConnectorDNSError,
@@ -69,7 +108,11 @@ class VoiceBot(commands.Bot):
 
         self._session = aiohttp.ClientSession()
         self.voicevox = VoicevoxClient(config.VOICEVOX_BASE_URL, self._session)
-        self.audio_queue = AudioQueueManager(synthesizer=self.voicevox.tts)
+        self.audio_queue = AudioQueueManager(
+            synthesizer=self.voicevox.tts,
+            max_pending_jobs=config.TTS_JOB_QUEUE_MAX_SIZE,
+            max_ready_audio=config.AUDIO_QUEUE_MAX_SIZE,
+        )
 
         # VOICEVOX Engine の疎通確認
         if await self.voicevox.check_health():
@@ -117,13 +160,30 @@ class VoiceBot(commands.Bot):
         error: app_commands.AppCommandError,
     ) -> None:
         """スラッシュコマンドのグローバルエラーハンドラ"""
+        if isinstance(error, app_commands.MissingPermissions):
+            try:
+                message = "このコマンドには「サーバーの管理」権限が必要です。"
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        message,
+                        ephemeral=True,
+                    )
+            except discord.NotFound:
+                logger.info(
+                    "権限エラー通知前にInteractionが失効しました (cmd=%s)",
+                    interaction.command,
+                )
+            return
+
         if isinstance(error, app_commands.CommandInvokeError):
             original = error.original
             # インタラクションのトークン切れは無視（ネットワーク遅延等で発生）
             if isinstance(original, discord.NotFound) and original.code == 10062:
                 logger.warning("インタラクショントークン切れ: %s", interaction.command)
                 return
-        logger.error("コマンドエラー: %s", error)
+        logger.error("コマンドエラー: %s", error, exc_info=error)
 
     async def close(self) -> None:
         """Bot終了時のクリーンアップ"""

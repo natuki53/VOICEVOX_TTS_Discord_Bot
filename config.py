@@ -1,4 +1,5 @@
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,6 +45,14 @@ MAX_TEXT_LENGTH: int = 100  # デフォルト最大文字数（これを超え�
 DEFAULT_SPEED: float = 1.0  # デフォルト読み上げ速度（0.5〜2.0）
 DEFAULT_READ_SENDER_NAME: bool = True  # デフォルトで送信者名を読み上げる
 SENDER_NAME_REPEAT_INTERVAL_SECONDS: int = 60  # 同一送信者の名前を再度読むまでの最小間隔
+TTS_JOB_QUEUE_MAX_SIZE: int = max(
+    1,
+    int(os.getenv("TTS_JOB_QUEUE_MAX_SIZE", "100")),
+)
+AUDIO_QUEUE_MAX_SIZE: int = max(
+    1,
+    int(os.getenv("AUDIO_QUEUE_MAX_SIZE", "20")),
+)
 
 # --- ランタイム状態（ギルドIDごとに管理） ---
 # guild_id -> text_channel_id: どのテキストchを読み上げ対象にするか
