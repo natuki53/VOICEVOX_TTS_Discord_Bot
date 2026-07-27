@@ -1,0 +1,36 @@
+name: voicevox_tts_discord_bot
+
+services:
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-latest
+    container_name: voicevox-engine
+    restart: unless-stopped
+    ports:
+      - "50021:50021"
+
+  bot:
+    image: "${BOT_IMAGE:-voicevox_tts_discord_bot-bot:latest}"
+    build:
+      context: .
+    container_name: voicevox-tts-discord-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - "${VOICEBOT_ENV_FILE:-.env}"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Tokyo
+    depends_on:
+      - voicevox
+    volumes:
+      - voicebot-data:/app/data
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  voicebot-data:
+    name: voicevox-tts-discord-bot-data

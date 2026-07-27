@@ -177,6 +177,57 @@ journalctl -u voicebot -f
 
 `voicevox-engine.service` の `ExecStart` は、VOICEVOX Engine の展開先に合わせて調整してください。
 
+## Docker Compose での起動
+
+`.env` の `VOICEVOX_URL` を `http://voicevox:50021` に設定してから起動します。
+
+```bash
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+Botのランタイム設定は `voicevox-tts-discord-bot-data` ボリュームへ保存されます。
+
+## GitHub Webhookによる自動更新
+
+`deploy/install_webhook.py` は、既存の
+[adnanh/webhook](https://github.com/adnanh/webhook) 受信コンテナへ、このBot用の
+フックを追加します。次の条件をすべて満たしたpushだけが更新を開始します。
+
+- GitHubの `X-Hub-Signature-256` が共有シークレットと一致する
+- イベントが `push`
+- ブランチが `main`
+- リポジトリが `natuki53/VOICEVOX_TTS_Discord_Bot`
+
+自宅サーバーでは次のコマンドで受信設定を追加します。
+
+```bash
+python3 deploy/install_webhook.py
+cd /home/natuki/services/web-server
+docker compose restart deploy
+```
+
+GitHubのリポジトリ設定でWebhookを次のように登録します。
+
+| 項目 | 値 |
+|---|---|
+| Payload URL | `https://mu-natuki.com/hooks/deploy-voicevox-tts-bot` |
+| Content type | `application/json` |
+| Secret | `/home/natuki/services/web-server/deploy/voicebot-webhook-secret` の内容 |
+| Events | Pushes |
+
+更新処理は
+`/home/natuki/services/discord-bots/VOICEVOX_TTS_Discord_Bot-managed`
+を管理専用チェックアウトとして使います。通常の作業ディレクトリは上書きしません。
+新しいDockerイメージを起動後、ログに `Bot起動完了:` が出るまで確認し、失敗した
+場合は直前のイメージへロールバックします。
+
+デプロイ状況は次のコマンドで確認できます。
+
+```bash
+docker logs -f voicebot-deployer
+```
+
 ## トラブルシュート
 
 - `ffmpegが見つかりません`  
