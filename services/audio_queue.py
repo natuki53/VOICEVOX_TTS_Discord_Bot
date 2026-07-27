@@ -9,8 +9,8 @@
 import asyncio
 import io
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Callable, Awaitable
 
 import discord
 
@@ -39,25 +39,44 @@ class AudioItem:
 
 
 class AudioQueueManager:
-    def __init__(self, synthesizer: TtsSynthesizer) -> None:
+    def __init__(
+        self,
+        synthesizer: TtsSynthesizer,
+        *,
+        max_pending_jobs: int = 100,
+        max_ready_audio: int = 20,
+    ) -> None:
         """
         Args:
             synthesizer: (text, speaker_id, speed) -> wav_bytes を返す非同期関数
+            max_pending_jobs: ギルドごとの未合成ジョブ上限
+            max_ready_audio: ギルドごとの合成済み音声上限
         """
+        if max_pending_jobs < 1 or max_ready_audio < 1:
+            raise ValueError("queue sizes must be positive")
+
         self._synthesizer = synthesizer
+        self._max_pending_jobs = max_pending_jobs
+        self._max_ready_audio = max_ready_audio
         # ギルドIDごとの TTS合成ジョブキュー
         self._job_queues: dict[int, asyncio.Queue[TtsJob]] = {}
         # ギルドIDごとの WAV再生キュー
         self._play_queues: dict[int, asyncio.Queue[AudioItem]] = {}
         # ギルドIDごとのワーカータスク (合成ワーカー, 再生ワーカー)
         self._workers: dict[int, tuple[asyncio.Task, asyncio.Task]] = {}
+        # cleanup時に現在の再生も停止できるようVoiceClientを保持する
+        self._active_voice_clients: dict[int, discord.VoiceClient] = {}
 
     def _get_or_create_guild(self, guild_id: int) -> None:
         """ギルド用のキューとワーカーを初期化する（未初期化の場合のみ）"""
         if guild_id in self._workers:
             return
-        self._job_queues[guild_id] = asyncio.Queue()
-        self._play_queues[guild_id] = asyncio.Queue()
+        self._job_queues[guild_id] = asyncio.Queue(
+            maxsize=self._max_pending_jobs
+        )
+        self._play_queues[guild_id] = asyncio.Queue(
+            maxsize=self._max_ready_audio
+        )
         loop = asyncio.get_running_loop()
         synth_task = loop.create_task(self._synth_worker(guild_id))
         play_task = loop.create_task(self._play_worker(guild_id))
@@ -80,7 +99,25 @@ class AudioQueueManager:
             guild_id=guild_id,
             voice_client=voice_client,
         )
-        await self._job_queues[guild_id].put(job)
+        job_queue = self._job_queues[guild_id]
+        if job_queue.full():
+            self._discard_oldest(job_queue)
+            logger.warning(
+                "TTS待機キューが上限に達したため最古のメッセージを破棄しました "
+                "(guild=%d, limit=%d)",
+                guild_id,
+                self._max_pending_jobs,
+            )
+        job_queue.put_nowait(job)
+
+    @staticmethod
+    def _discard_oldest(queue: asyncio.Queue) -> None:
+        """満杯のキューから最古の項目を1件破棄する。"""
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        queue.task_done()
 
     async def _synth_worker(self, guild_id: int) -> None:
         """TTS合成ワーカー: ジョブキューを順番に合成してWAVキューへ積む"""
@@ -101,7 +138,15 @@ class AudioQueueManager:
                     guild_id=guild_id,
                     voice_client=job.voice_client,
                 )
-                await play_queue.put(item)
+                if play_queue.full():
+                    self._discard_oldest(play_queue)
+                    logger.warning(
+                        "音声再生キューが上限に達したため最古の音声を破棄しました "
+                        "(guild=%d, limit=%d)",
+                        guild_id,
+                        self._max_ready_audio,
+                    )
+                play_queue.put_nowait(item)
             except Exception as e:
                 logger.error("TTS合成エラー (guild=%d): %s", guild_id, e)
             finally:
@@ -142,29 +187,65 @@ class AudioQueueManager:
         try:
             vc.play(source, after=after_play)
         except Exception as e:
+            source.cleanup()
             logger.error("vc.play() に失敗しました (guild=%d): %s", item.guild_id, e)
             done_event.set()
             raise
 
+        self._active_voice_clients[item.guild_id] = vc
         try:
             await asyncio.wait_for(done_event.wait(), timeout=60.0)
+        except asyncio.CancelledError:
+            self._stop_voice_client(vc)
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "音声再生がタイムアウトしました。スキップします (guild=%d)", item.guild_id
             )
-            # タイムアウト時はFFmpegプロセスを確実に停止してリソースを解放する
-            try:
-                if vc.is_connected() and vc.is_playing():
-                    vc.stop()
-            except Exception as e:
-                logger.debug("タイムアウト後のvc.stop()でエラー (guild=%d): %s", item.guild_id, e)
+            self._stop_voice_client(vc)
+        finally:
+            if self._active_voice_clients.get(item.guild_id) is vc:
+                self._active_voice_clients.pop(item.guild_id, None)
+
+    @staticmethod
+    def _stop_voice_client(vc: discord.VoiceClient) -> None:
+        """再生中または一時停止中の音声プレイヤーを安全に停止する。"""
+        try:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+        except Exception as e:
+            logger.debug("音声停止時のエラー: %s", e)
+
+    async def wait_until_idle(self, guild_id: int, timeout: float) -> bool:
+        """合成待ちと再生待ちの両キューが空になるまで待つ。"""
+        job_queue = self._job_queues.get(guild_id)
+        play_queue = self._play_queues.get(guild_id)
+        if job_queue is None or play_queue is None:
+            return True
+
+        async def wait_for_queues() -> None:
+            # 合成キュー完了時点で、生成された音声は再生キューへ追加済み。
+            await job_queue.join()
+            await play_queue.join()
+
+        try:
+            await asyncio.wait_for(wait_for_queues(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def cleanup(self, guild_id: int) -> None:
         """ギルドのキューとワーカータスクを終了する"""
+        voice_client = self._active_voice_clients.pop(guild_id, None)
+        if voice_client is not None:
+            self._stop_voice_client(voice_client)
+
         if guild_id in self._workers:
             synth_task, play_task = self._workers.pop(guild_id)
             synth_task.cancel()
             play_task.cancel()
+
+        self.clear_queue(guild_id)
         self._job_queues.pop(guild_id, None)
         self._play_queues.pop(guild_id, None)
 

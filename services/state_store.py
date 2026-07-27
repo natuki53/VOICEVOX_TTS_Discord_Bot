@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 STATE_FILE_PATH = Path(os.getenv("RUNTIME_STATE_FILE", "data/runtime_state.json"))
 
 _save_lock = threading.Lock()
+_sequence_lock = threading.Lock()
+_latest_save_sequence = 0
 
 
 def _to_int_key_map(data: Any, *, value_cast: type[int] | type[float] = int) -> dict[int, Any]:
@@ -173,8 +175,20 @@ def _snapshot_runtime_state() -> dict[str, Any]:
     }
 
 
-def _write_state_sync(data: dict[str, Any]) -> None:
+def _next_save_sequence() -> int:
+    global _latest_save_sequence
+    with _sequence_lock:
+        _latest_save_sequence += 1
+        return _latest_save_sequence
+
+
+def _write_state_sync(data: dict[str, Any], sequence: int) -> None:
     with _save_lock:
+        # Executorが逆順に実行されても、古い設定で新しい設定を上書きしない。
+        with _sequence_lock:
+            if sequence < _latest_save_sequence:
+                return
+
         try:
             STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
             temp_path = STATE_FILE_PATH.with_suffix(".tmp")
@@ -194,11 +208,12 @@ def save_runtime_state() -> None:
     別スレッドに逃がす。ループ外（起動時/終了時）では同期的に書き込む。
     """
     data = _snapshot_runtime_state()
+    sequence = _next_save_sequence()
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        _write_state_sync(data)
+        _write_state_sync(data, sequence)
         return
 
-    loop.run_in_executor(None, _write_state_sync, data)
+    loop.run_in_executor(None, _write_state_sync, data, sequence)
