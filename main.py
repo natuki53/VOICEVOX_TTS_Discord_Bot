@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+from bot_status import BotStatusReporter
 from services.audio_queue import AudioQueueManager
 from services.state_store import load_runtime_state, save_runtime_state
 from services.voicevox import VoicevoxClient
@@ -101,6 +102,16 @@ class VoiceBot(commands.Bot):
         self.voicevox: VoicevoxClient | None = None
         self.audio_queue: AudioQueueManager | None = None
         self._session: aiohttp.ClientSession | None = None
+        self.status_reporter = BotStatusReporter(
+            bot_id="voicevox-tts",
+            discord_connected=lambda: self.is_ready() and not self.is_closed(),
+            gateway_latency_ms=lambda: self.latency * 1_000,
+            dependencies=self._status_dependencies,
+        )
+
+    async def _status_dependencies(self) -> list[dict[str, object]]:
+        connected = await self.voicevox.check_health() if self.voicevox else False
+        return [{"id": "voicevox-engine", "connected": connected}]
 
     async def setup_hook(self) -> None:
         """Bot起動時の初期化処理"""
@@ -144,6 +155,7 @@ class VoiceBot(commands.Bot):
         else:
             synced = await self.tree.sync()
             logger.info("スラッシュコマンドをグローバル同期しました (count=%d)", len(synced))
+        self.status_reporter.start()
 
     async def on_ready(self) -> None:
         logger.info("Bot起動完了: %s (ID: %s)", self.user, self.user.id)
@@ -187,6 +199,7 @@ class VoiceBot(commands.Bot):
 
     async def close(self) -> None:
         """Bot終了時のクリーンアップ"""
+        await self.status_reporter.close()
         save_runtime_state()
         if self.audio_queue:
             self.audio_queue.cleanup_all()

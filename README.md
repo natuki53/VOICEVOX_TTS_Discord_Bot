@@ -261,3 +261,14 @@ VOICEVOX で生成した音声は商用・非商用を問わず利用可能で�
 ### 本 Bot で利用しているライブラリ
 
 - **discord.py**: https://github.com/Rapptz/discord.py
+
+## 公開ステータス用ハートビート
+
+Docker Composeで起動すると、Botは10秒ごとに
+`/home/natuki/services/runtime-status/voicevox-tts/status.json`へ公開監視用の
+ハートビートを書き出します。初回起動前にホスト側のディレクトリをUID/GID
+`1000:1000`、モード`0750`で作成してください。
+
+出力はBot ID、起動日時、更新日時、Discord接続状態、Gateway遅延、
+VOICEVOX Engineの疎通状態だけです。Discord上の情報、トークン、ログは含めません。
+別のホストパスを使う場合はCompose実行時に`BOT_STATUS_HOST_DIR`を指定できます。
