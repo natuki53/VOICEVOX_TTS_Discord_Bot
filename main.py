@@ -62,16 +62,19 @@ if _logging_file_error:
     logger.warning("ファイルログを初期化できませんでした: %s", _logging_file_error)
 
 RETRYABLE_DISCORD_ERRORS = (
-    aiohttp.ClientConnectorDNSError,
-    aiohttp.ClientConnectorError,
-    aiohttp.ClientOSError,
+    aiohttp.ClientConnectionError,
     asyncio.TimeoutError,
+    discord.GatewayNotFound,
 )
 
 COGS = [
     "cogs.voice",
     "cogs.tts",
 ]
+
+
+def _discord_retry_wait_seconds(retry_count: int) -> int:
+    return min(60, 5 * (2 ** min(max(retry_count - 1, 0), 4)))
 
 
 def check_ffmpeg() -> None:
@@ -102,6 +105,7 @@ class VoiceBot(commands.Bot):
         self.voicevox: VoicevoxClient | None = None
         self.audio_queue: AudioQueueManager | None = None
         self._session: aiohttp.ClientSession | None = None
+        self.gateway_ready_once = False
         self.status_reporter = BotStatusReporter(
             bot_id="voicevox-tts",
             discord_connected=lambda: self.is_ready() and not self.is_closed(),
@@ -158,6 +162,7 @@ class VoiceBot(commands.Bot):
         self.status_reporter.start()
 
     async def on_ready(self) -> None:
+        self.gateway_ready_once = True
         logger.info("Bot起動完了: %s (ID: %s)", self.user, self.user.id)
         await self.change_presence(
             activity=discord.Activity(
@@ -215,14 +220,18 @@ async def main() -> None:
         bot = VoiceBot()
         try:
             async with bot:
-                await bot.start(config.DISCORD_TOKEN)
+                # discord.py の再接続待ちは最大約17分まで伸びる。接続エラーを
+                # この上限60秒の再試行ループへ返し、Botを作り直す。
+                await bot.start(config.DISCORD_TOKEN, reconnect=False)
             return
         except discord.LoginFailure:
             logger.error("DISCORD_TOKENが無効です。環境変数を確認してください。")
             return
         except RETRYABLE_DISCORD_ERRORS as e:
+            if bot.gateway_ready_once:
+                retry_count = 0
             retry_count += 1
-            wait_seconds = min(60, 5 * (2 ** min(retry_count - 1, 4)))
+            wait_seconds = _discord_retry_wait_seconds(retry_count)
             logger.warning(
                 "Discord接続に失敗しました (%s): %s / %d秒後に再試行します。",
                 e.__class__.__name__,
