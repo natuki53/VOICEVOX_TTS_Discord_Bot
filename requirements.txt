@@ -1,5 +1,7 @@
-discord.py[voice]>=2.7.0
+discord.py[voice]>=2.7.0,<2.8
 PyNaCl>=1.5.0
-davey>=0.1.0
+# discord.py 2.7.x does not implement davey 0.2's key transitions (silent audio).
+# Revisit both version limits after https://github.com/Rapptz/discord.py/pull/10548 is released.
+davey>=0.1.6,<0.2
 aiohttp>=3.9.0
 python-dotenv>=1.0.0
