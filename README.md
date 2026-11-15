@@ -198,6 +198,14 @@ Botのランタイム設定とローテーションログは
 
 ## GitHub Webhookによる自動更新
 
+変更は作業ブランチからPRを作成し、`Python tests` チェックの成功後に `main` へ
+マージします。`main` は管理者を含めてPR経由の変更を必須とし、直接push・force push・
+ブランチ削除を禁止しています。テスト対象はマージ先の最新 `main` を取り込んだ状態です。
+
+マージによる `main` の更新をWebhookが受信すると、本番Botを自動更新します。
+マージ後は `voicebot-deployer` の終了コードと `Deployment completed: <コミットSHA>`、
+Botの起動・Discord接続・VOICEVOX接続を確認してください。
+
 `deploy/install_webhook.py` は、既存の
 [adnanh/webhook](https://github.com/adnanh/webhook) 受信コンテナへ、このBot用の
 フックを追加します。次の条件をすべて満たしたpushだけが更新を開始します。
