@@ -14,7 +14,7 @@ from services.voicevox import VoicevoxError
 
 logger = logging.getLogger(__name__)
 
-IDLE_DISCONNECT_SECONDS = 60
+IDLE_DISCONNECT_SECONDS = 30
 IDLE_DISCONNECT_RECHECK_DELAY_SECONDS = 3
 VOICE_RECONNECT_GRACE_SECONDS = 10
 MAX_AUTOCOMPLETE_CHOICES = 25
@@ -557,7 +557,10 @@ class VoiceCog(commands.Cog):
 
     async def _idle_disconnect_after_delay(self, guild_id: int) -> None:
         try:
-            await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
+            # 再確認の待ち時間も自動切断までの時間に含める。
+            await asyncio.sleep(
+                max(0, IDLE_DISCONNECT_SECONDS - IDLE_DISCONNECT_RECHECK_DELAY_SECONDS)
+            )
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 return
