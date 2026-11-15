@@ -58,6 +58,7 @@ class VoiceCog(commands.Cog):
         self._speaker_options_cache: list[tuple[int, str]] = []
         self._speaker_cache_updated_at = 0.0
         self._speaker_cache_lock = asyncio.Lock()
+        self._voice_connection_locks: dict[int, asyncio.Lock] = {}
 
     @staticmethod
     def _pick_representative_style_id(styles: list[dict]) -> int | None:
@@ -132,17 +133,50 @@ class VoiceCog(commands.Cog):
         self,
         guild: discord.Guild,
     ) -> discord.VoiceClient | None:
+        async with self._get_voice_connection_lock(guild.id):
+            return await self._get_or_recover_vc_unlocked(guild)
+
+    def _get_voice_connection_lock(self, guild_id: int) -> asyncio.Lock:
+        return self._voice_connection_locks.setdefault(guild_id, asyncio.Lock())
+
+    async def _get_or_recover_vc_unlocked(
+        self,
+        guild: discord.Guild,
+    ) -> discord.VoiceClient | None:
         """
         接続済みVoiceClientを取得する。
 
-        BotがVCにいるのにVoiceClient参照が同期ずれしている場合は、
-        1回だけ再接続で回復を試みる。
+        ギルドの接続ロックを保持した状態で呼び出す。
+        切断済み参照を解放し、BotがまだVCにいれば1回だけ再接続する。
         """
         vc = self._get_connected_vc(guild)
         if vc:
             return vc
 
         bot_channel = self._get_bot_voice_channel(guild)
+
+        # BotのVoiceStateが空でも古い参照は残りうる。connect()が「接続済み」と
+        # 判定するキャッシュを、次の接続を始める前に必ず解放する。
+        stale_clients = [vc for vc in self.bot.voice_clients if vc.guild.id == guild.id]
+        if guild.voice_client is not None and all(
+            vc is not guild.voice_client for vc in stale_clients
+        ):
+            stale_clients.append(guild.voice_client)
+        if stale_clients:
+            self.bot.audio_queue.cleanup(guild.id)
+        for stale in stale_clients:
+            try:
+                await asyncio.wait_for(stale.disconnect(force=True), timeout=5.0)
+            except Exception as e:
+                logger.warning("古いVoiceClientの切断に失敗しました (guild=%d): %s", guild.id, e)
+            finally:
+                # disconnect()が途中で失敗するとdiscord.py側のcleanupに到達しない。
+                if guild.voice_client is stale or any(
+                    vc is stale for vc in self.bot.voice_clients
+                ):
+                    stale.cleanup()
+
+        self._cancel_bot_disconnect_grace(guild.id)
         if bot_channel is None:
             return None
 
@@ -151,15 +185,6 @@ class VoiceCog(commands.Cog):
             guild.id,
             bot_channel.name,
         )
-
-        # 同ギルドの古いVoiceClient参照を掃除する
-        for stale in list(self.bot.voice_clients):
-            if stale.guild.id != guild.id:
-                continue
-            try:
-                await stale.disconnect(force=True)
-            except Exception as e:
-                logger.debug("古いVoiceClientの切断をスキップしました (guild=%d): %s", guild.id, e)
 
         try:
             recovered = await bot_channel.connect(timeout=15.0, reconnect=True)
@@ -635,7 +660,18 @@ class VoiceCog(commands.Cog):
             return
 
         target_vc = interaction.user.voice.channel
-        vc = await self._get_or_recover_vc(guild)
+        async with self._get_voice_connection_lock(guild.id):
+            await self._join_voice_channel(interaction, guild, target_vc)
+
+    async def _join_voice_channel(
+        self,
+        interaction: discord.Interaction,
+        guild: discord.Guild,
+        target_vc: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        self._cancel_idle_disconnect(guild.id)
+        self._cancel_bot_disconnect_grace(guild.id)
+        vc = await self._get_or_recover_vc_unlocked(guild)
         current_read_channel_id = config.TTS_CHANNEL_MAP.get(guild.id)
 
         channel_mention = (
@@ -718,7 +754,15 @@ class VoiceCog(commands.Cog):
         if not await self._defer_once(interaction):
             return
 
-        vc = await self._get_or_recover_vc(guild)
+        async with self._get_voice_connection_lock(guild.id):
+            await self._leave_voice_channel(interaction, guild)
+
+    async def _leave_voice_channel(
+        self,
+        interaction: discord.Interaction,
+        guild: discord.Guild,
+    ) -> None:
+        vc = await self._get_or_recover_vc_unlocked(guild)
         if not vc:
             self._cancel_idle_disconnect(guild.id)
             self._clear_guild_session(guild.id)
