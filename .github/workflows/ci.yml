@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 10
     env:
       DISCORD_TOKEN: ci-placeholder
-      RUNTIME_STATE_FILE: ${{ runner.temp }}/voicebot-runtime-state.json
+      RUNTIME_STATE_FILE: data/ci-runtime-state.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
