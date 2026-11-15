@@ -238,6 +238,11 @@ docker logs -f voicebot-deployer
 
 ## トラブルシュート
 
+- VCに参加して発話表示も出るのに音が聞こえない
+  `discord.py 2.7.x` と `davey 0.2.x` の組み合わせでは、音声暗号化の互換性により無音になります。
+  [上流の対応状況](https://github.com/Rapptz/discord.py/pull/10548)を確認したうえで、
+  `pip install -r requirements.txt` で互換版（`davey>=0.1.6,<0.2`）へ戻し、Botを再起動して `/join` してください。
+  Dockerの場合は `docker compose up -d --build --no-deps bot` でBotのイメージを再構築します。
 - `ffmpegが見つかりません`  
   `ffmpeg` が PATH に入っていません。macOS は `brew install ffmpeg`、Ubuntu は `sudo apt install ffmpeg` を実行してください。
 - スラッシュコマンドが表示されない  
